@@ -1,56 +1,42 @@
 # DeepSeek Harness ACP
 
-`@dumbo-ai/dsh-acp` connects ACP clients such as Dumbo and Zed to DeepSeek Harness. Installing the package also installs Harness; users do not need a separate `dsh` installation or a `cordis.yml` file.
+Run DeepSeek Harness in a local project from an Agent Client Protocol (ACP) client such as Dumbo or Zed. The client provides the chat interface and asks you to approve tool calls. Harness runs the model and tools. The `dsh-acp` adapter sends messages, task progress and tool results back to the client.
 
-[简体中文](README.md)
+[中文](README.md)
 
-**0.7.0 supports ACP v1 and experimental v2.** The adapter calls Harness directly, with one session runtime shared by both protocols. Harness is pinned to **0.2.1-rc.4**.
+## Connect a client
 
-## Install or upgrade
+1. Install Node.js **24.9.0 or later**, then run:
 
-Use Node.js **>=24.9.0**:
+   ```sh
+   npm install -g @dumbo-ai/dsh-acp@0.7.0
+   dsh-acp --version
+   ```
 
-```bash
-npm install -g @dumbo-ai/dsh-acp@0.7.0
-dsh-acp --version
-```
+   The version command should print `0.7.0`. The package installs its Harness dependencies.
 
-Set the client launch command to `dsh-acp`, leave arguments empty, and configure `DEEPSEEK_API_KEY` in its environment. Restart the client after upgrading. The client starts the process and communicates over stdio.
+2. Add a custom ACP agent to your client. Set the command to `dsh-acp`, leave its arguments empty and set `DEEPSEEK_API_KEY` in the agent process environment. For Dumbo, merge the following `dsh` entry into `acp-agent-config.json`:
 
-Protocol negotiation preserves existing v1 clients. Experimental v2 clients request version 2 using the same entrypoint; no extra command-line flag is necessary.
+   ```json
+   {
+     "acp_agent_servers": {
+       "dsh": {
+         "type": "custom",
+         "command": "dsh-acp",
+         "args": [],
+         "env": { "DEEPSEEK_API_KEY": "your API key" }
+       }
+     }
+   }
+   ```
 
-For a temporary install, use `npx --yes @dumbo-ai/dsh-acp@0.7.0`. For daily use, install globally first so the client does not wait for a download on startup.
+3. Restart the client, open your project directory, select the agent and send a message. If the client cannot find the executable, run `command -v dsh-acp` in your shell and use the absolute path as the command. Starting `dsh-acp` directly in a terminal leaves it waiting for a protocol message on standard input.
 
-| Environment variable  | Purpose                                                                                                  |
-| --------------------- | -------------------------------------------------------------------------------------------------------- |
-| `DEEPSEEK_API_KEY`    | DeepSeek API key                                                                                         |
-| `DEEPSEEK_BASE_URL`   | Optional compatible endpoint; omit for the official service, or use `https://api.deepseek.com/anthropic` |
-| `DSH_HOME`            | Optional Harness settings, credentials and session directory                                             |
-| `DSH_PERMISSION_MODE` | Optional Harness preset, such as `read-only`, `workspace-write` or `danger-full-access`                  |
+To try the adapter without a global install, set the client command to `npx` and its arguments to `["--yes", "@dumbo-ai/dsh-acp@0.7.0"]`.
 
-Custom base URLs pass through unchanged. The old official API root is incompatible with the default Messages route.
+## Models and environment
 
-For Dumbo, retain the existing `acp_agent_servers.dsh` entry with `type: "custom"`, `command: "dsh-acp"`, `args: []`, and `env: { "DEEPSEEK_API_KEY": "your-key" }`. If necessary, use the absolute path from `command -v dsh-acp`. Upgrading from 0.6.0 requires no changes to this entry.
-
-## Features
-
-Both protocols share one Harness runtime for model/reasoning selection, permission decisions, stdio/HTTP MCP, session listing, resuming, cancellation and closing. Plans, titles, tool categories and context usage are enabled by default. Titles and task lists use Harness data; the adapter does not make extra model requests to invent them. A new turn clears the previous task list. History listings include cached titles when available.
-
-| Behavior           | ACP v1                            | Experimental ACP v2                                 |
-| ------------------ | --------------------------------- | --------------------------------------------------- |
-| Prompt response    | Waits for turn completion         | Returns a message ID after insertion                |
-| Foreground state   | Completion is the prompt response | Separate running, requires_action and idle updates  |
-| Prompts while busy | Rejected                          | Queued; acknowledged only when inserted             |
-| Resume             | Restores context, title and plan  | Synchronizes current state; optional history replay |
-| Messages/tools     | Existing v1 updates               | Identified message and tool upserts                 |
-
-V2 clients request retained history using `replayFrom: { "type": "start" }`. Omission restores context without replaying history. Completion, errors and cancellation wait for the Harness driver to retire before allowing the next turn.
-
-Work started by Harness itself also keeps the session busy. Cancelling a queued message leaves existing work running; closing the session reports the cancelled idle state after that work stops.
-
-## Configuration
-
-No configuration file is required. To select a default model, create an overlay:
+The bundled profile selects `deepseek-v4-flash` from `deepseek-official`. A client can change models through the session configuration and select a reasoning effort when the model supports it. To start new sessions with Pro, set the client arguments to `["--patch", "/absolute/path/to/acp.patch.yml"]` and use this patch:
 
 ```yaml
 - id: dsh-acp
@@ -59,24 +45,38 @@ No configuration file is required. To select a default model, create an overlay:
     model: deepseek-v4-pro
 ```
 
-Launch with `dsh-acp --patch /absolute/path/to/acp.patch.yml`. Harness owns `--patch`; repeated overlays apply in order and replace the matched entry's entire `config`. Keep all required fields. Do not re-enable the original `acp` entry: two servers would compete for stdio.
+You can pass `--patch` more than once. A patch replaces the target entry’s entire `config`, so include both provider and model. The bundled profile disables the official `acp` server to give this adapter exclusive access to standard input and output. The old `--config` option for complete configuration files has been removed. See the [bundled profile](assets/acp.patch.yml) and [example patch](examples/acp.patch.yml).
 
-`--config` and complete custom `cordis.yml` files were removed in 0.6.0. Existing no-argument and `--patch` usage remains compatible.
+| Variable | Purpose |
+| --- | --- |
+| `DEEPSEEK_API_KEY` | API key for the default DeepSeek service. |
+| `DEEPSEEK_BASE_URL` | Optional. Omit for the official Messages endpoint, `https://api.deepseek.com/anthropic`. A custom endpoint must support that route. |
+| `DSH_HOME` | Directory where Harness stores settings, credentials and sessions. |
+| `DSH_PERMISSION_MODE` | Harness permission preset, such as `read-only` or `workspace-write`. |
 
-## Limits
+## Sessions, tools and protocol versions
 
-The v2 implementation uses the experimental entrypoint in ACP TypeScript SDK **2.1.0**. Its draft protocol may change. Standard stdio/HTTP MCP is supported; MCP-over-ACP, forks, deletion, additional directories, audio, embedded context, ACP modes/commands, terminal views, client filesystem operations and elicitation are not advertised or implemented.
+The client negotiates ACP v1 or experimental v2 at startup. Both use the same Harness runtime. Clients can list sessions, resume a session in its original project directory, cancel work or close a session. Each session can use client-supplied stdio or HTTP MCP servers. When a tool needs approval, the client offers a one-time allow or reject choice.
 
-Messages and thoughts are sent after Harness commits them, without token-by-token streaming. Image admission depends on the selected model and Harness configuration. Resuming requires the same working directory. Replacing an active session's MCP configuration waits for its foreground work to finish. stdout contains only ACP JSON-RPC; diagnostics use stderr.
+| Client operation | ACP v1 | Experimental ACP v2 |
+| --- | --- | --- |
+| Send a message | The request returns when the turn ends | Returns a message ID on acceptance; execution state arrives separately |
+| Send another message while busy | Returns a busy error | Queues the message and acknowledges it when admitted |
+| Resume a session | Restores context, title and plan | Syncs current state; pass `replayFrom: { "type": "start" }` to replay message history |
 
-## Embedding and development
+Tool updates carry a category, status and result. Plans come from the model’s task tool and clear at the start of the next turn. Text and reasoning arrive when Harness commits a message, so clients may receive a whole block at once. Image input depends on the model and Harness configuration. Audio, embedded context, MCP-over-ACP, client file operations and terminal views are currently unsupported.
 
-The root and `./plugin` exports provide a Cordis plugin with `apply`, `Config`, and `inject`. Compose the Harness services named in `inject` first. Settings are `provider`, `model`, `sessionListPageSize`, and an optional runtime `stream`. Do not mount another ACP server.
+## Run from source
 
-For source development, run `pnpm install` and `pnpm check`, then configure the client to launch the absolute Node executable with the absolute path to the project's `dist/bin.js` as its argument.
+```sh
+pnpm install
+pnpm check
+```
 
-`pnpm check` runs typechecking, lint, build and tests. Process tests use a deterministic model with real Harness, tools, MCP and persistence; no API key is required. See [ADR 0003](docs/adr/0003-direct-acp-v1-v2.md) and the [0.7.0 release notes](docs/releases/0.7.0.md).
+`pnpm check` runs type checking, linting, the build and the test suite. After building, set your client command to the absolute path to Node and pass the absolute path to this checkout’s `dist/bin.js` as its argument. The project pins DeepSeek Harness to `0.2.1-rc.4` and the ACP SDK to `2.1.0`. Process tests run Harness with a deterministic model fixture and require no DeepSeek API key.
+
+To embed the Cordis plugin, import `@dumbo-ai/dsh-acp/plugin` and supply the services declared in `inject`. In addition to the model settings, `sessionListPageSize` controls history pagination (default 100) and `stream` overrides the default stdio transport. See the [plugin entry point](src/plugin.ts), [session runtime](src/harness/runtime.ts) and [protocol design](docs/adr/0003-direct-acp-v1-v2.md).
 
 ## License
 
-Apache-2.0. Some integration helpers are adapted from MIT-licensed Harness code; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+[Apache License 2.0](LICENSE). Some Harness integration code is adapted from the MIT-licensed upstream implementation. See [third-party notices](THIRD_PARTY_NOTICES.md) for attribution.
