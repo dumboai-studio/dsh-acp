@@ -1,6 +1,6 @@
 # DeepSeek Harness ACP
 
-用 Dumbo（飞象）、Zed 等支持 Agent Client Protocol（ACP）的客户端，在本地项目中运行 DeepSeek Harness。客户端负责对话界面和工具授权，Harness 运行模型与工具，`dsh-acp` 把会话消息、任务进度和工具结果传回客户端。
+支持 Agent Client Protocol（ACP）的客户端，在本地项目中运行 DeepSeek Harness。客户端负责对话界面和工具授权，Harness 运行模型与工具，`dsh-acp` 把会话消息、任务进度和工具结果传回客户端。
 
 [English](README.en.md)
 
