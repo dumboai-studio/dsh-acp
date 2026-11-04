@@ -1,21 +1,66 @@
 # DeepSeek Harness ACP
 
-支持 Agent Client Protocol（ACP）的客户端，在本地项目中运行 DeepSeek Harness。客户端负责对话界面和工具授权，Harness 运行模型与工具，`dsh-acp` 把会话消息、任务进度和工具结果传回客户端。
+[English](README.md) | [简体中文](README.zh.md)
 
-[English](README.en.md)
+**ACP v1 + ACP v2 (experimental)** · Direct Harness integration · One shared session runtime
 
-## 接入客户端
+Run DeepSeek Harness in a local project from an Agent Client Protocol (ACP) client such as Dumbo or Zed. The client provides the chat interface and asks you to approve tool calls. Harness runs the model and tools. The `dsh-acp` adapter sends messages, task progress and tool results back to the client.
 
-1. 安装 Node.js **24.9.0 或更高版本**，然后运行：
+## Architecture
+
+```mermaid
+flowchart TB
+    C["ACP client<br/>Chat, model picker and permissions"]
+    subgraph Adapter["dsh-acp"]
+        R["Protocol negotiation<br/>initialize.protocolVersion"]
+        V1["ACP v1<br/>Turn response"]
+        V2["ACP v2 · experimental<br/>Message IDs and session state"]
+        S["Shared session runtime<br/>Queue, resume, cancel and close"]
+        H["DeepSeek Harness<br/>Agent execution"]
+        P["Event presentation<br/>Messages, plans, titles and tool updates"]
+        D[("Harness state<br/>Sessions, settings and credentials")]
+        R <--> V1
+        R <--> V2
+        V1 <--> S
+        V2 <--> S
+        S <--> H
+        H --> P
+        P --> R
+        H <--> D
+    end
+    C <-->|"JSON-RPC over stdio"| R
+    H <-->|"Model requests"| L["Configured model provider"]
+    H <-->|"Tool execution"| T["Project tools and MCP servers"]
+    classDef protocol fill:#e0f2fe,stroke:#0284c7,color:#0f172a
+    classDef runtime fill:#ecfdf5,stroke:#059669,color:#0f172a
+    classDef external fill:#f1f5f9,stroke:#64748b,color:#0f172a
+    class R,V1,V2 protocol
+    class S,H,P runtime
+    class C,D,L,T external
+    style Adapter fill:#f8fafc,stroke:#cbd5e1
+```
+
+The same launch command supports both protocol versions. The client selects v1 or experimental v2 during initialization; no extra launch flag is needed. The adapter calls Harness directly. It does not relay the official Harness ACP server.
+
+- Switch models and reasoning effort from the client.
+- Show task plans, session titles, tool categories and context usage from Harness events.
+- List and resume sessions, approve tools, cancel work and close sessions.
+- With v2, use message IDs, separate execution-state updates, queued prompts and optional history replay.
+
+Installing `dsh-acp` automatically installs Harness. No separate `dsh` installation or `cordis.yml` is needed.
+
+## Connect a client
+
+1. Install Node.js **24.9.0 or later**, then run:
 
    ```sh
    npm install -g @dumbo-ai/dsh-acp@0.7.0
    dsh-acp --version
    ```
 
-   版本命令应输出 `0.7.0`。安装包已包含所需的 Harness 依赖。
+   The version command should print `0.7.0`. The package installs its Harness dependencies.
 
-2. 在客户端添加自定义 ACP Agent。启动命令填 `dsh-acp`，参数留空，在该进程的环境变量中设置 `DEEPSEEK_API_KEY`。对 Dumbo，将下面的 `dsh` 条目合并到 `acp-agent-config.json`：
+2. Add a custom ACP agent to your client. Set the command to `dsh-acp`, leave its arguments empty and set `DEEPSEEK_API_KEY` in the agent process environment. For Dumbo, merge the following `dsh` entry into `acp-agent-config.json`:
 
    ```json
    {
@@ -24,19 +69,19 @@
          "type": "custom",
          "command": "dsh-acp",
          "args": [],
-         "env": { "DEEPSEEK_API_KEY": "替换为你的 API Key" }
+         "env": { "DEEPSEEK_API_KEY": "your API key" }
        }
      }
    }
    ```
 
-3. 重启客户端，打开项目目录，选择刚添加的 Agent 并发送消息。若客户端找不到命令，在终端运行 `command -v dsh-acp`，将输出的绝对路径填入 `command`。直接运行 `dsh-acp` 时，它会等待客户端从标准输入发来协议消息。
+3. Restart the client, open your project directory, select the agent and send a message. If the client cannot find the executable, run `command -v dsh-acp` in your shell and use the absolute path as the command. Starting `dsh-acp` directly in a terminal leaves it waiting for a protocol message on standard input.
 
-临时试用时也可以将客户端的启动命令设为 `npx`，参数设为 `["--yes", "@dumbo-ai/dsh-acp@0.7.0"]`。
+To try the adapter without a global install, set the client command to `npx` and its arguments to `["--yes", "@dumbo-ai/dsh-acp@0.7.0"]`.
 
-## 模型与运行环境
+## Models and environment
 
-默认配置使用 `deepseek-official` 的 `deepseek-v4-flash`。客户端可通过会话配置切换模型；模型支持时，也可以选择思考强度。要让新会话默认使用 Pro，将客户端启动参数设为 `["--patch", "/absolute/path/to/acp.patch.yml"]`，补丁内容如下：
+The bundled profile selects `deepseek-v4-flash` from `deepseek-official`. A client can change models through the session configuration and select a reasoning effort when the model supports it. To start new sessions with Pro, set the client arguments to `["--patch", "/absolute/path/to/acp.patch.yml"]` and use this patch:
 
 ```yaml
 - id: dsh-acp
@@ -45,38 +90,40 @@
     model: deepseek-v4-pro
 ```
 
-`--patch` 可以重复传入。补丁替换目标条目的整个 `config`，请同时填写 provider 和 model。内置配置已禁用官方 `acp` 服务，让此适配器独占标准输入输出。旧版完整配置文件 `--config` 已移除。见[内置配置](assets/acp.patch.yml)和[补丁示例](examples/acp.patch.yml)。
+You can pass `--patch` more than once. A patch replaces the target entry’s entire `config`, so include both provider and model. The bundled profile disables the official `acp` server to give this adapter exclusive access to standard input and output. The old `--config` option for complete configuration files has been removed. See the [bundled profile](assets/acp.patch.yml) and [example patch](examples/acp.patch.yml).
 
-| 环境变量 | 用途 |
-| --- | --- |
-| `DEEPSEEK_API_KEY` | 默认官方服务使用的 API Key。 |
-| `DEEPSEEK_BASE_URL` | 可选。官方 Messages 端点为 `https://api.deepseek.com/anthropic`；使用默认端点时可省略。自定义地址需兼容该路由。 |
-| `DSH_HOME` | 指定 Harness 保存设置、凭据和会话的目录。 |
-| `DSH_PERMISSION_MODE` | 选择 Harness 权限预设，例如 `read-only` 或 `workspace-write`。 |
+| Variable              | Purpose                                                                                                                             |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `DEEPSEEK_API_KEY`    | API key for the default DeepSeek service.                                                                                           |
+| `DEEPSEEK_BASE_URL`   | Optional. Omit for the official Messages endpoint, `https://api.deepseek.com/anthropic`. A custom endpoint must support that route. |
+| `DSH_HOME`            | Directory where Harness stores settings, credentials and sessions.                                                                  |
+| `DSH_PERMISSION_MODE` | Harness permission preset, such as `read-only` or `workspace-write`.                                                                |
 
-## 会话、工具与协议
+## Sessions, tools and protocol versions
 
-客户端会自动协商 ACP v1 或实验性 v2。两者共用 Harness 会话，可列出历史记录、在原项目目录恢复会话、取消任务或关闭会话。客户端可为会话提供 stdio 或 HTTP MCP 服务器。工具需要授权时，用户可以在客户端选择允许一次或拒绝。
+The client negotiates ACP v1 or experimental v2 at startup. Both use the same Harness runtime. Clients can list sessions, resume a session in its original project directory, cancel work or close a session. Each session can use client-supplied stdio or HTTP MCP servers. When a tool needs approval, the client offers a one-time allow or reject choice.
 
-| 客户端行为 | ACP v1 | 实验性 ACP v2 |
-| --- | --- | --- |
-| 发送一条消息 | 请求在本轮执行结束后返回 | 消息被接收后返回消息 ID，执行状态另行通知 |
-| 运行中再次发送 | 返回忙碌错误 | 排队等待，轮到该消息时才确认接收 |
-| 恢复已有会话 | 恢复上下文、标题和任务计划 | 默认同步当前状态；传入 `replayFrom: { "type": "start" }` 可回放历史消息 |
+| Client operation                | ACP v1                                 | Experimental ACP v2                                                                       |
+| ------------------------------- | -------------------------------------- | ----------------------------------------------------------------------------------------- |
+| Send a message                  | The request returns when the turn ends | Returns a message ID after insertion into the session; execution state arrives separately |
+| Send another message while busy | Returns a busy error                   | Queues the message and acknowledges it when admitted                                      |
+| Resume a session                | Restores context, title and plan       | Syncs current state; pass `replayFrom: { "type": "start" }` to replay message history     |
 
-工具调用带有类别、执行状态和结果。任务清单来自模型调用的任务工具，每轮开始时会清除上一轮清单。正文和思考内容在 Harness 提交消息后送达，界面可能一次收到一段内容。图片输入取决于模型和 Harness 配置；当前未提供音频、嵌入式上下文、MCP-over-ACP、客户端文件操作或终端视图。
+Session titles come from Harness and appear in updates and history listings when available. Tool updates carry a category, status and result. Plans come from the model’s task tool and clear at the start of the next turn. Text and reasoning arrive when Harness commits a message, so clients may receive a whole block at once. Image input depends on the model and Harness configuration. Audio, embedded context, MCP-over-ACP, client file operations and terminal views are currently unsupported.
 
-## 从源码运行
+ACP v2 uses the experimental entrypoint in ACP SDK `2.1.0`; it is not a claim of a stable v2 specification. Cancellation and completion wait for the Harness turn to finish before admitting the next prompt. See the [protocol validation results](docs/validation/2026-10-30-acp-v2.md) for tested behavior and limits.
+
+## Run from source
 
 ```sh
 pnpm install
 pnpm check
 ```
 
-`pnpm check` 依次执行类型检查、lint、构建和测试。构建后，在客户端将启动命令设为 Node 的绝对路径，参数填入本仓库 `dist/bin.js` 的绝对路径。本项目固定使用 DeepSeek Harness `0.2.1-rc.4` 和 ACP SDK `2.1.0`。进程级测试用可预测的模型替身运行真实 Harness，无需 DeepSeek API Key。
+`pnpm check` runs type checking, linting, the build and the test suite. After building, set your client command to the absolute path to Node and pass the absolute path to this checkout’s `dist/bin.js` as its argument. The project pins DeepSeek Harness to `0.2.1-rc.4` and the ACP SDK to `2.1.0`. Process tests run Harness with a deterministic model fixture and require no DeepSeek API key.
 
-程序化接入可从 `@dumbo-ai/dsh-acp/plugin` 导入 Cordis 插件。宿主需提供插件声明的 `inject` 服务；除模型设置外，`sessionListPageSize` 控制历史列表每页条数（默认 100），`stream` 可替换默认的标准输入输出。实现见[插件入口](src/plugin.ts)、[会话运行时](src/harness/runtime.ts)和[协议设计说明](docs/adr/0003-direct-acp-v1-v2.md)。
+To embed the Cordis plugin, import `@dumbo-ai/dsh-acp/plugin` and supply the services declared in `inject`. In addition to the model settings, `sessionListPageSize` controls history pagination (default 100) and `stream` overrides the default stdio transport. See the [plugin entry point](src/plugin.ts), [session runtime](src/harness/runtime.ts) and [protocol design](docs/adr/0003-direct-acp-v1-v2.md).
 
-## 许可证
+## License
 
-项目使用 [Apache License 2.0](LICENSE)。部分 Harness 接入代码改编自 MIT 许可的官方实现，署名和许可声明见[第三方许可](THIRD_PARTY_NOTICES.md)。
+[Apache License 2.0](LICENSE). Some Harness integration code is adapted from the MIT-licensed upstream implementation. See [third-party notices](THIRD_PARTY_NOTICES.md) for attribution.
