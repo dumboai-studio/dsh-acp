@@ -1,12 +1,12 @@
 /** Direct Harness session ownership, queued admission and quiescent completion. */
 import type { Context } from '@deepseek-ai/cordis'
 import { RequestError } from '@agentclientprotocol/sdk'
-import type { Agent, AgentHandle, AgentStatus, ModelSelection } from '@deepseek-ai/dsh-agent'
-import { createUserMessage, errorChain, type UserMessage } from '@deepseek-ai/dsh-llm'
+import type { Agent, AgentHandle, AgentStatus } from '@deepseek-ai/dsh-agent'
+import { createUserMessage, errorChain } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent, TurnEndReason } from '@deepseek-ai/dsh-session'
 import type { TodoItem } from '@deepseek-ai/dsh-tool-todo'
 import { AcpContentError, admitAcpPrompt } from './content.js'
-import type { AcpModelControl } from './model.js'
+import { AcpModelControl } from './model.js'
 import { untilAborted } from './abort.js'
 import type { McpMount } from './mcp.js'
 import type {
@@ -42,7 +42,7 @@ export interface PromptOperation {
 
 export class HarnessSession {
   readonly agent: Agent
-  readonly model: AcpModelControl
+  private readonly model: AcpModelControl
   private tail = Promise.resolve()
   private readonly queue: Submission[] = []
   private current: Submission | undefined
@@ -51,7 +51,6 @@ export class HarnessSession {
   private ended: TurnEndReason | undefined
   private agentError: Error | undefined
   private outputError: Error | undefined
-  private turnSelection: ModelSelection | undefined
   private activity: Activity = { state: 'idle' }
   private activityAbort = new AbortController()
   private readonly waitingPermissions = new Set<string>()
@@ -66,13 +65,12 @@ export class HarnessSession {
   constructor(
     private readonly ctx: Context,
     private readonly handle: AgentHandle,
-    model: AcpModelControl,
     private readonly mcp: McpMount,
     private mcpServers: readonly McpConfiguration[],
     private readonly output: RuntimeOutput,
   ) {
     this.agent = handle.agent
-    this.model = model
+    this.model = new AcpModelControl(ctx.llm, this.agent.model)
   }
 
   get session(): Session {
@@ -87,9 +85,9 @@ export class HarnessSession {
     return this.model.options(signal)
   }
 
-  setConfig(id: string, value: unknown, signal?: AbortSignal): Promise<ModelOption[]> {
+  setConfig(id: string, value: unknown, signal: AbortSignal): Promise<ModelOption[]> {
     this.assertOpen()
-    return this.model.set(id, value, signal)
+    return this.model.set(id, value, AbortSignal.any([signal, this.lifetime.signal]))
   }
 
   replaceMcp(servers: readonly McpConfiguration[], requestSignal: AbortSignal): Promise<void> {
@@ -186,6 +184,7 @@ export class HarnessSession {
           this.agent.cancel({ kind: 'user' })
           try {
             await this.agent.whenIdle()
+            this.model.finishTurn()
           } catch (idleError) {
             failure = new AggregateError([error, idleError])
           }
@@ -212,7 +211,6 @@ export class HarnessSession {
         if (this.activity.state !== 'idle') await this.setActivity({ state: 'idle', outcome })
         await this.tail
         this.current = undefined
-        this.turnSelection = undefined
       } else if (this.queue[0] === submission) {
         this.queue.shift()
       }
@@ -241,7 +239,7 @@ export class HarnessSession {
       signal.throwIfAborted()
       if (configuration !== this.configurationTail || !this.isForegroundIdle()) continue
       this.mcp.assertReady()
-      const selection = this.model.snapshot()
+      const selection = this.model.selected
       const content = await admitAcpPrompt(
         this.ctx,
         selection,
@@ -252,6 +250,7 @@ export class HarnessSession {
       signal.throwIfAborted()
       // Image admission can await I/O while Harness starts an independent turn.
       if (configuration !== this.configurationTail || !this.isForegroundIdle()) continue
+      if (!this.model.matches(selection)) continue
       if (this.ctx.agents.get(this.agent.id) !== this.agent)
         throw new Error('the Harness agent is no longer active')
       const message = createUserMessage({ content, source: { kind: 'user' } })
@@ -261,7 +260,7 @@ export class HarnessSession {
       this.agentError = undefined
       this.activityAbort = submission.abort
       submission.id = message.id
-      this.turnSelection = selection
+      this.model.beginTurn()
       this.agent.followup(message)
       return
     }
@@ -297,13 +296,17 @@ export class HarnessSession {
         await this.agent.whenIdle()
       }
       await this.tail
-      if (this.agent.status === 'idle' && this.session.seq === seq) return
+      if (this.agent.status === 'idle' && this.session.seq === seq) {
+        this.model.finishTurn()
+        return
+      }
     }
   }
 
   onEvent(event: SessionEvent): void {
     if (!this.ready) return
     if (event.type === 'turn/start') {
+      this.model.beginTurn()
       this.ended = undefined
       this.activeTools.clear()
       if (this.activity.state === 'idle') {
@@ -318,7 +321,6 @@ export class HarnessSession {
     if (event.type === 'turn/end') {
       this.ended = event.data.reason
       this.agentError = undefined
-      this.model.releaseTurn(event.data.turn)
     }
     void this.enqueue({ type: 'event', event, replay: false })
     if (event.type === 'tool/call') this.activeTools.add(event.data.callId)
@@ -326,11 +328,6 @@ export class HarnessSession {
       this.activeTools.delete(event.data.message.toolCallId)
       void this.permissionState()
     }
-  }
-
-  onClaimed(message: UserMessage, turn: number): void {
-    if (message.id === this.current?.id && this.turnSelection !== undefined)
-      this.model.pinTurn(turn, this.turnSelection)
   }
 
   onError(error: unknown): void {
@@ -507,6 +504,7 @@ export class HarnessSession {
         await (this.ctx.get('subagents') as Descendants | undefined)?.drainDescendants([this.agent])
       },
       async () => {
+        this.model.finishTurn()
         await this.ctx.sessions.flush(this.session)
       },
       async () => {

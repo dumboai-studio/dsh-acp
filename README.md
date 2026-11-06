@@ -54,11 +54,11 @@ Installing `dsh-acp` automatically installs Harness. No separate `dsh` installat
 1. Install Node.js **24.9.0 or later**, then run:
 
    ```sh
-   npm install -g @dumbo-ai/dsh-acp@0.7.0
+   npm install -g @dumbo-ai/dsh-acp@0.7.1
    dsh-acp --version
    ```
 
-   The version command should print `0.7.0`. The package installs its Harness dependencies.
+   The version command should print `0.7.1`. The package installs its Harness dependencies.
 
 2. Add a custom ACP agent to your client. Set the command to `dsh-acp`, leave its arguments empty and set `DEEPSEEK_API_KEY` in the agent process environment. For Dumbo, merge the following `dsh` entry into `acp-agent-config.json`:
 
@@ -77,7 +77,7 @@ Installing `dsh-acp` automatically installs Harness. No separate `dsh` installat
 
 3. Restart the client, open your project directory, select the agent and send a message. If the client cannot find the executable, run `command -v dsh-acp` in your shell and use the absolute path as the command. Starting `dsh-acp` directly in a terminal leaves it waiting for a protocol message on standard input.
 
-To try the adapter without a global install, set the client command to `npx` and its arguments to `["--yes", "@dumbo-ai/dsh-acp@0.7.0"]`.
+To try the adapter without a global install, set the client command to `npx` and its arguments to `["--yes", "@dumbo-ai/dsh-acp@0.7.1"]`.
 
 ## Models and environment
 
@@ -109,9 +109,11 @@ The client negotiates ACP v1 or experimental v2 at startup. Both use the same Ha
 | Send another message while busy | Returns a busy error                   | Queues the message and acknowledges it when admitted                                      |
 | Resume a session                | Restores context, title and plan       | Syncs current state; pass `replayFrom: { "type": "start" }` to replay message history     |
 
+If you switch models or reasoning effort during a turn, the new choice applies to the next turn. You can reopen ordinary conversation forks created in 0.7.0 from the history list.
+
 Session titles come from Harness and appear in updates and history listings when available. Tool updates carry a category, status and result. Plans come from the model’s task tool and clear at the start of the next turn. Text and reasoning arrive when Harness commits a message, so clients may receive a whole block at once. Image input depends on the model and Harness configuration. Audio, embedded context, MCP-over-ACP, client file operations and terminal views are currently unsupported.
 
-ACP v2 uses the experimental entrypoint in ACP SDK `2.1.0`; it is not a claim of a stable v2 specification. Cancellation and completion wait for the Harness turn to finish before admitting the next prompt. See the [protocol validation results](docs/validation/2026-10-30-acp-v2.md) for tested behavior and limits.
+ACP v2 uses the experimental entrypoint in ACP SDK `2.1.0`; it is not a claim of a stable v2 specification. Cancellation and completion wait for the Harness turn to finish before admitting the next prompt. See the [protocol validation results](docs/releases/0.7.1.md) for tested behavior and limits.
 
 ## Run from source
 
@@ -120,7 +122,7 @@ pnpm install
 pnpm check
 ```
 
-`pnpm check` runs type checking, linting, the build and the test suite. After building, set your client command to the absolute path to Node and pass the absolute path to this checkout’s `dist/bin.js` as its argument. The project pins DeepSeek Harness to `0.2.1-rc.4` and the ACP SDK to `2.1.0`. Process tests run Harness with a deterministic model fixture and require no DeepSeek API key.
+`pnpm check` runs type checking, linting, the build and the test suite. After building, set your client command to the absolute path to Node and pass the absolute path to this checkout’s `dist/bin.js` as its argument. The project pins DeepSeek Harness to `0.2.2-rc.1` and the ACP SDK to `2.1.0`. Process tests run Harness with a deterministic model fixture and require no DeepSeek API key.
 
 To embed the Cordis plugin, import `@dumbo-ai/dsh-acp/plugin` and supply the services declared in `inject`. In addition to the model settings, `sessionListPageSize` controls history pagination (default 100) and `stream` overrides the default stdio transport. See the [plugin entry point](src/plugin.ts), [session runtime](src/harness/runtime.ts) and [protocol design](docs/adr/0003-direct-acp-v1-v2.md).
 

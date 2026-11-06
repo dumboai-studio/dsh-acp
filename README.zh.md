@@ -54,11 +54,11 @@ flowchart TB
 1. 安装 Node.js **24.9.0 或更高版本**，然后运行：
 
    ```sh
-   npm install -g @dumbo-ai/dsh-acp@0.7.0
+   npm install -g @dumbo-ai/dsh-acp@0.7.1
    dsh-acp --version
    ```
 
-   版本命令应输出 `0.7.0`。安装包已包含所需的 Harness 依赖。
+   版本命令应输出 `0.7.1`。安装包已包含所需的 Harness 依赖。
 
 2. 在客户端添加自定义 ACP Agent。启动命令填 `dsh-acp`，参数留空，在该进程的环境变量中设置 `DEEPSEEK_API_KEY`。对 Dumbo，将下面的 `dsh` 条目合并到 `acp-agent-config.json`：
 
@@ -77,7 +77,7 @@ flowchart TB
 
 3. 重启客户端，打开项目目录，选择刚添加的 Agent 并发送消息。若客户端找不到命令，在终端运行 `command -v dsh-acp`，将输出的绝对路径填入 `command`。直接运行 `dsh-acp` 时，它会等待客户端从标准输入发来协议消息。
 
-临时试用时也可以将客户端的启动命令设为 `npx`，参数设为 `["--yes", "@dumbo-ai/dsh-acp@0.7.0"]`。
+临时试用时也可以将客户端的启动命令设为 `npx`，参数设为 `["--yes", "@dumbo-ai/dsh-acp@0.7.1"]`。
 
 ## 模型与运行环境
 
@@ -109,9 +109,11 @@ flowchart TB
 | 运行中再次发送 | 返回忙碌错误               | 排队等待，轮到该消息时才确认接收                                        |
 | 恢复已有会话   | 恢复上下文、标题和任务计划 | 默认同步当前状态；传入 `replayFrom: { "type": "start" }` 可回放历史消息 |
 
+执行中切换模型或思考强度，会从下一轮生效。用 0.7.0 创建的普通会话分支，也能从历史列表里重新打开。
+
 会话标题来自 Harness；有标题数据时，会显示在会话更新和历史列表中。工具调用带有类别、执行状态和结果。任务清单来自模型调用的任务工具，每轮开始时会清除上一轮清单。正文和思考内容在 Harness 提交消息后送达，界面可能一次收到一段内容。图片输入取决于模型和 Harness 配置；当前未提供音频、嵌入式上下文、MCP-over-ACP、客户端文件操作或终端视图。
 
-ACP v2 使用 ACP SDK `2.1.0` 的实验性入口，不代表 v2 协议已经稳定。取消和结束都会等待 Harness 本轮执行退出，再接收下一轮消息。已验证的行为与限制见[协议验证记录](docs/validation/2026-10-30-acp-v2.md)。
+ACP v2 使用 ACP SDK `2.1.0` 的实验性入口，不代表 v2 协议已经稳定。取消和结束都会等待 Harness 本轮执行退出，再接收下一轮消息。已验证的行为与限制见[协议验证记录](docs/releases/0.7.1.md)。
 
 ## 从源码运行
 
@@ -120,7 +122,7 @@ pnpm install
 pnpm check
 ```
 
-`pnpm check` 依次执行类型检查、lint、构建和测试。构建后，在客户端将启动命令设为 Node 的绝对路径，参数填入本仓库 `dist/bin.js` 的绝对路径。本项目固定使用 DeepSeek Harness `0.2.1-rc.4` 和 ACP SDK `2.1.0`。进程级测试用可预测的模型替身运行真实 Harness，无需 DeepSeek API Key。
+`pnpm check` 依次执行类型检查、lint、构建和测试。构建后，在客户端将启动命令设为 Node 的绝对路径，参数填入本仓库 `dist/bin.js` 的绝对路径。本项目固定使用 DeepSeek Harness `0.2.2-rc.1` 和 ACP SDK `2.1.0`。进程级测试用可预测的模型替身运行真实 Harness，无需 DeepSeek API Key。
 
 程序化接入可从 `@dumbo-ai/dsh-acp/plugin` 导入 Cordis 插件。宿主需提供插件声明的 `inject` 服务；除模型设置外，`sessionListPageSize` 控制历史列表每页条数（默认 100），`stream` 可替换默认的标准输入输出。实现见[插件入口](src/plugin.ts)、[会话运行时](src/harness/runtime.ts)和[协议设计说明](docs/adr/0003-direct-acp-v1-v2.md)。
 

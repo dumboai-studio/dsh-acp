@@ -49,6 +49,7 @@ function launch(cwd: string, permissions: 'allow' | 'hold' = 'allow', patches: s
   })
   const notifications: acp.UpdateSessionNotification[] = []
   const requests: acp.RequestPermissionRequest[] = []
+  const permissionGate = Promise.withResolvers<undefined>()
   const listeners = new Set<() => void>()
   const connection = acp
     .client({ name: 'v2-test' })
@@ -56,11 +57,11 @@ function launch(cwd: string, permissions: 'allow' | 'hold' = 'allow', patches: s
       notifications.push(params)
       for (const listener of listeners) listener()
     })
-    .onRequest(acp.methods.client.session.requestPermission, ({ params }) => {
+    .onRequest(acp.methods.client.session.requestPermission, async ({ params }) => {
       requests.push(params)
       for (const listener of listeners) listener()
-      // Deliberately uncooperative: session/cancel must still unblock Harness.
-      if (permissions === 'hold') return new Promise<acp.RequestPermissionResponse>(() => undefined)
+      // An unanswered permission intentionally ignores cancellation by the agent.
+      if (permissions === 'hold') await permissionGate.promise
       return { outcome: { outcome: 'selected', optionId: 'allow-once' } }
     })
     .connect(
@@ -89,6 +90,7 @@ function launch(cwd: string, permissions: 'allow' | 'hold' = 'allow', patches: s
     agent: connection.agent,
     notifications,
     requests,
+    allowPermissions: () => permissionGate.resolve(undefined),
     assertStateBeforeResponse() {
       const frames: {
         method?: string
@@ -407,21 +409,23 @@ describe('direct Harness ACP v2', () => {
 
   it('admits queued prompts in order, pins each turn model and keeps repeated tool calls distinct', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'dsh-acp-fifo-'))
-    const server = launch(cwd)
+    const server = launch(cwd, 'hold')
     try {
       await server.initialize()
       const { sessionId } = await server.newSession()
-      const first = await server.prompt(sessionId, 'gate')
-      await server.waitFor(() =>
-        server.notifications.some(
-          (n) => acp.SessionUpdate.isToolCallUpdate(n.update) && n.update.status === 'completed',
-        ),
-      )
+      const first = await server.prompt(sessionId, 'first')
+      await server.waitFor(() => server.requests.length === 1)
       await server.agent.request(acp.methods.agent.session.setConfigOption, {
         sessionId,
         configId: 'model',
         type: 'id',
         value: '["fixture","beta"]',
+      })
+      await server.agent.request(acp.methods.agent.session.setConfigOption, {
+        sessionId,
+        configId: 'reasoning_effort',
+        type: 'id',
+        value: 'low',
       })
       const second = server.prompt(sessionId, 'repeat')
       const third = server.prompt(sessionId, 'repeat')
@@ -432,7 +436,7 @@ describe('direct Harness ACP v2', () => {
           .filter(acp.SessionUpdate.isUserMessage)
           .map((m) => m.messageId),
       ).toEqual([first.messageId])
-      await writeFile(join(cwd, 'release'), '')
+      server.allowPermissions()
       const accepted = await Promise.all([second, third])
       await server.waitFor(
         () =>
@@ -449,8 +453,8 @@ describe('direct Harness ACP v2', () => {
       const messages = server.notifications
         .map((n) => n.update)
         .filter(acp.SessionUpdate.isAgentMessage)
-      expect(JSON.stringify(messages[0])).toContain('model=alpha')
-      expect(JSON.stringify(messages[1])).toContain('model=beta')
+      expect(JSON.stringify(messages[0])).toContain('model=alpha; effort=high')
+      expect(JSON.stringify(messages[1])).toContain('model=beta; effort=low')
       expect(JSON.stringify(messages[2])).toContain('turns=3')
       const calls = server.notifications
         .map((n) => n.update)
@@ -461,6 +465,42 @@ describe('direct Harness ACP v2', () => {
         if (request.subject != null && acp.RequestPermissionSubject.isToolCall(request.subject))
           expect(calls.map((c) => c.toolCallId)).toContain(request.subject.toolCall.toolCallId)
       }
+      await server.finish()
+    } finally {
+      await server.stop()
+      await rm(cwd, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  it('restores an unused model and effort change after disconnecting during a turn', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'dsh-acp-pending-model-'))
+    let server = launch(cwd, 'hold')
+    try {
+      await server.initialize()
+      const { sessionId } = await server.newSession()
+      await server.prompt(sessionId, 'before disconnect')
+      await server.waitFor(() => server.requests.length > 0)
+      for (const [configId, value] of [
+        ['model', '["fixture","beta"]'],
+        ['reasoning_effort', 'low'],
+      ] as const) {
+        await server.agent.request(acp.methods.agent.session.setConfigOption, {
+          sessionId,
+          configId,
+          type: 'id',
+          value,
+        })
+      }
+      await server.finish()
+
+      server = launch(cwd)
+      await server.initialize()
+      await server.agent.request(acp.methods.agent.session.resume, { sessionId, cwd, mcpServers })
+      await server.idle(sessionId)
+      const start = server.notifications.length
+      await server.prompt(sessionId, 'after restart')
+      await server.idle(sessionId, start)
+      expect(reply(server.notifications.slice(start))).toContain('model=beta; effort=low')
       await server.finish()
     } finally {
       await server.stop()

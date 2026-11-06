@@ -5,14 +5,13 @@ import { realpath } from 'node:fs/promises'
 import { isAbsolute, resolve } from 'node:path'
 import { RequestError } from '@agentclientprotocol/sdk'
 import { brandString } from '@deepseek-ai/dsh-brand'
-import type { ModelSelection } from '@deepseek-ai/dsh-agent'
+import { installModelSelection } from '@deepseek-ai/dsh-agent'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-user-approval'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-session-projection-cache'
 import type { DshAcpConfig } from '../config.js'
 import { supportsAcpImagePrompts } from './content.js'
-import { AcpModelControl } from './model.js'
 import { mountAcpMcpServers, type McpMount } from './mcp.js'
 import { HarnessSession } from './session.js'
 import type { McpConfiguration, RuntimeOutput } from './types.js'
@@ -44,10 +43,6 @@ export class HarnessRuntime {
     ctx.on('session/event', (session, event) => {
       const record = this.records.get(session.id)
       if (record?.session === session) record.onEvent(event)
-    })
-    ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
-      const record = this.records.get(agent.session.id)
-      if (record?.agent === agent) record.onClaimed(message, turn)
     })
     ctx.on('agent/error', ({ agent, error }) => {
       const record = this.records.get(agent.session.id)
@@ -135,24 +130,19 @@ export class HarnessRuntime {
     try {
       if (id !== undefined) {
         const stored = await this.ctx.sessionPersistence.stat(sessionId, { signal })
-        if (
-          stored === undefined ||
-          stored.header.origin === 'subagent' ||
-          stored.header.parentSession !== undefined
-        )
+        if (stored === undefined || stored.header.origin === 'subagent')
           throw new RequestError(-32002, `Unknown session: ${id}`)
         if (!(await sameDirectory(stored.header.cwd, params.cwd)))
           throw RequestError.invalidParams(undefined, 'session cwd does not match')
       }
-      const initial: ModelSelection | undefined =
-        this.config.provider === undefined || this.config.model === undefined
-          ? undefined
-          : { provider: this.config.provider, model: this.config.model }
-      let model = new AcpModelControl(this.ctx.llm, initial)
       let mcp: McpMount | undefined
       const agentOptions = {
         ...(this.config.provider === undefined ? {} : { provider: this.config.provider }),
         ...(this.config.model === undefined ? {} : { model: this.config.model }),
+      }
+      const setup = async (agentCtx: Context): Promise<void> => {
+        installModelSelection(agentCtx)
+        mcp = await mountAcpMcpServers(agentCtx, params.mcpServers, params.cwd)
       }
       const handle =
         id === undefined
@@ -161,31 +151,15 @@ export class HarnessRuntime {
               meta: { cwd: params.cwd },
               agentOptions,
               signal,
-              setup: async (agentCtx) => {
-                model.install(agentCtx)
-                mcp = await mountAcpMcpServers(agentCtx, params.mcpServers, params.cwd)
-              },
+              setup,
             })
           : await this.ctx.agents.resume({
               resumeSessionId: sessionId,
               agentOptions,
               signal,
-              setup: async (agentCtx, agent) => {
-                const logged = agent.session.requestHeader()
-                if (logged !== undefined)
-                  model = new AcpModelControl(this.ctx.llm, {
-                    provider: logged.config.provider,
-                    model: logged.config.model,
-                    ...(logged.config.reasoningEffort === undefined ||
-                    logged.adapterDefaults?.reasoningEffort === true
-                      ? {}
-                      : { reasoningEffort: logged.config.reasoningEffort }),
-                  })
-                model.install(agentCtx)
-                mcp = await mountAcpMcpServers(agentCtx, params.mcpServers, params.cwd)
-              },
+              setup,
             })
-      record = new HarnessSession(this.ctx, handle, model, mcp!, params.mcpServers, output)
+      record = new HarnessSession(this.ctx, handle, mcp!, params.mcpServers, output)
       signal.throwIfAborted()
       this.records.set(sessionId, record)
       await record.configOptions(signal)
@@ -218,7 +192,6 @@ export class HarnessRuntime {
           (!includeActive && this.records.has(header.id)) ||
           this.activating.has(header.id) ||
           header.origin === 'subagent' ||
-          header.parentSession !== undefined ||
           header.cwd === undefined ||
           !isAbsolute(header.cwd)
         )

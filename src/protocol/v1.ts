@@ -52,7 +52,7 @@ function output(
         return
       }
       if (update.type === 'plan') {
-        await send(planUpdate(update.todos === null ? null : [...update.todos]))
+        await send(planUpdate(update.todos))
         return
       }
       if (update.type === 'config') {

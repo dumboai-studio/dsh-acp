@@ -6,7 +6,7 @@ Status: Implemented in 0.7.0. Supersedes ADR 0002.
 
 Use one Harness session runtime and two ACP SDK handlers. The SDK 2.1.0 protocol router negotiates v1 or experimental v2 at initialization. Neither handler invokes the official Harness ACP implementation. The existing Harness CLI profile still composes the model, tools, persistence and startup services; the packaged overlay disables its ACP server and loads our plugin.
 
-The adapter pins Harness 0.2.1-rc.4 and calls public exports: `agents.create/resume`, `Agent.followup/cancel/whenIdle`, model selection, typed session events, registered title/todo projections, session persistence readers and title checkpoints. Some content/model/MCP admission helpers are adapted from the same MIT-licensed release, with attribution in THIRD_PARTY_NOTICES.md. No deprecated in-memory event snapshots or private official ACP imports are used. These public APIs are pre-stable, so every dependency upgrade still requires compatibility checks.
+The adapter pins its Harness dependencies to the same [CLI release](../../package.json) and uses `agents.create/resume`, `Agent.followup/cancel/whenIdle`, model selection, typed session events, registered title/todo projections, session persistence readers and title checkpoints. Some content/model/MCP admission helpers are adapted from the MIT-licensed upstream sources, with attribution in THIRD_PARTY_NOTICES.md. No deprecated in-memory event snapshots or private official ACP imports are used. These public APIs are pre-stable, so every dependency upgrade still requires compatibility checks.
 
 ## Session ownership
 
@@ -20,7 +20,7 @@ Errors after v2 insertion become idle state updates with an error stop reason. N
 
 V1 retains its existing resume-without-replay behavior. V2 always synchronizes foreground state before responding. A `start` replay cursor reads retained events through the public persistence service and reconstructs messages, tools and plans. Live updates are buffered during synchronization and delivered in order so replay cannot overwrite newer state. User message IDs survive reconnects. Unknown cursors are rejected.
 
-The registered title/todo projections supply current snapshots and live changes. Tool categories are inferred from known tool names; unknown and MCP tools remain generic. Model configuration is per session and pinned to each admitted turn. A model change affects future turns. MCP replacement waits for foreground quiescence and restores the previous mounts if loading the replacement fails; failed rollback prevents further prompts on that session.
+The registered title/todo projections supply current snapshots and live changes. Tool categories are inferred from known tool names; unknown and MCP tools remain generic. Model configuration is per session and pinned to each admitted turn. Model changes during execution are deferred until the agent is idle. Harness records the selection through `agent.model.select()` and restores it through `agent.model.current()` when the session reopens. MCP replacement waits for foreground quiescence and restores the previous mounts if loading the replacement fails; failed rollback prevents further prompts on that session.
 
 ## Compatibility limits
 

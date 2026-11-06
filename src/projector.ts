@@ -1,6 +1,6 @@
 /** Pure display mappings; Harness owns the projected state and tool execution. */
 import type { SessionUpdate, ToolKind } from '@agentclientprotocol/sdk'
-import type { SessionProjectionMap } from '@deepseek-ai/dsh-session-projection'
+import type { SessionProjectionViewValues } from '@deepseek-ai/dsh-session-projection'
 import type {} from '@deepseek-ai/dsh-session-title'
 import type {} from '@deepseek-ai/dsh-tool-todo'
 
@@ -20,7 +20,7 @@ export function toolKind(name: string): ToolKind {
 }
 
 /** Map the registered todo projection; null clears the previous turn's plan. */
-export function planUpdate(todos: SessionProjectionMap['todos']): SessionUpdate {
+export function planUpdate(todos: Readonly<SessionProjectionViewValues['todos']>): SessionUpdate {
   return {
     sessionUpdate: 'plan',
     entries: (todos ?? []).map((todo) => ({ ...todo, priority: 'medium' })),
@@ -29,7 +29,7 @@ export function planUpdate(todos: SessionProjectionMap['todos']): SessionUpdate 
 
 /** Forward an accepted Harness title without manufacturing one for empty sessions. */
 export function titleUpdate(
-  title: SessionProjectionMap['title'] | undefined,
+  title: SessionProjectionViewValues['title'] | undefined,
 ): SessionUpdate | undefined {
   return title == null ? undefined : { sessionUpdate: 'session_info_update', title }
 }

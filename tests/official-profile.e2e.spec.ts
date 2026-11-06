@@ -1,6 +1,6 @@
 /** Exercise the published launcher and official ACP profile through its wire API. */
 import { spawn } from 'node:child_process'
-import { mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable, Writable } from 'node:stream'
@@ -291,6 +291,62 @@ describe('direct Harness ACP v1 compatibility', () => {
       await process.finish()
     } finally {
       await process.stop()
+      await rm(cwd, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  it('lists and resumes a 0.7.0 fork while keeping subagent sessions private', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'dsh-acp-legacy-fork-'))
+    const server = launch(cwd)
+    try {
+      await server.agent.request(methods.agent.initialize, {
+        protocolVersion: 1,
+        clientCapabilities: {},
+      })
+      const parent = await server.agent.request(methods.agent.session.new, { cwd, mcpServers: [] })
+      const root = join(cwd, '.sessions')
+      const [project] = await readdir(root)
+      const recording = await readFile(
+        new URL('./fixtures/official/rc4-fork.jsonl', import.meta.url),
+        'utf8',
+      )
+      const [first, ...events] = recording.split('\n')
+      const header = JSON.parse(first!) as Record<string, unknown>
+      for (const [id, meta] of [
+        ['legacy-fork', {}],
+        ['legacy-subagent', { origin: 'subagent', delegationDepth: 1 }],
+      ] as const) {
+        const dir = join(root, project!, id)
+        await mkdir(dir)
+        const firstLine = JSON.stringify({
+          ...header,
+          id,
+          cwd,
+          parentSession: parent.sessionId,
+          ...meta,
+        })
+        await writeFile(join(dir, 'session.v4.jsonl'), [firstLine, ...events].join('\n'))
+      }
+      expect(await server.agent.request(methods.agent.session.list, { cwd })).toEqual({
+        sessions: [{ sessionId: 'legacy-fork', cwd }],
+      })
+      await expect(
+        server.agent.request(methods.agent.session.resume, {
+          sessionId: 'legacy-fork',
+          cwd,
+          mcpServers: [],
+        }),
+      ).resolves.toHaveProperty('configOptions')
+      await expect(
+        server.agent.request(methods.agent.session.resume, {
+          sessionId: 'legacy-subagent',
+          cwd,
+          mcpServers: [],
+        }),
+      ).rejects.toMatchObject({ code: -32002 })
+      await server.finish()
+    } finally {
+      await server.stop()
       await rm(cwd, { recursive: true, force: true })
     }
   }, 30_000)

@@ -1,0 +1,5 @@
+{"type":"session","version":4,"id":"legacy-fork","createdAt":1793945969396,"cwd":"/workspace","parentSession":"legacy-parent","isSeeded":true,"delegationDepth":0}
+{"type":"permission/preset","seq":0,"time":1793945969266,"data":{"preset":"read-only"}}
+{"type":"sandbox/mode","seq":1,"time":1793945969268,"data":{"mode":"read-only"}}
+{"type":"approval/policy","seq":2,"time":1793945969268,"data":{"policy":"ask"}}
+{"type":"session/end-seed","seq":3,"time":1793945969268,"data":{"inherited":true}}
