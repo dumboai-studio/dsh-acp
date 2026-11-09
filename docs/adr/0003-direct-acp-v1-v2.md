@@ -22,9 +22,17 @@ V1 retains its existing resume-without-replay behavior. V2 always synchronizes f
 
 The registered title/todo projections supply current snapshots and live changes. Tool categories are inferred from known tool names; unknown and MCP tools remain generic. Model configuration is per session and pinned to each admitted turn. Model changes during execution are deferred until the agent is idle. Harness records the selection through `agent.model.select()` and restores it through `agent.model.current()` when the session reopens. MCP replacement waits for foreground quiescence and restores the previous mounts if loading the replacement fails; failed rollback prevents further prompts on that session.
 
+## Streaming and permissions
+
+The public `agent/assistant-stream` event supplies text and reasoning deltas. They share the session output queue with committed events and completion. V1 appends each delta once and suppresses its committed text duplicate; v2 appends chunks and replaces them with the committed content snapshot. Complete text blocks without deltas are also delivered. V1 cannot retract provider text replacements; v2 reconciles them at settlement.
+
+Assistant message IDs are adapter-owned turn/step/attempt coordinates, with a distinct reasoning ID. Counting durable `assistant/message` and `assistant/attempt` events gives replay the same IDs as live output, including retries. These IDs replace the Harness assistant IDs previously exposed by 0.7.1; clients retaining that version's transcript should rebuild it once from a start replay when upgrading. User message IDs remain unchanged. Failed attempts retain their visible prefix as transcript output without adding model-visible history. Cancellation uses Harness's durable interrupted-message prefix. This adapter writes no additional session events.
+
+The optional public `permissionPresets` service supplies the session's `mode` config option. Changes use its setter and flush the session; permission projection and catalog changes publish the full options snapshot. A profile without that service exposes no mode selector. Saved custom permission combinations remain selectable only as their current no-op value. Model and permission mutations are ordered within each session.
+
 ## Compatibility limits
 
-Existing CLI/environment/overlay usage and v1 display behavior remain supported. The adapter implements SDK 2.1.0's baseline v2 session surface, not every optional draft extension. It does not advertise MCP-over-ACP, additional directories, fork/delete, token streaming, ACP terminal/filesystem, modes/commands or elicitation. The primary session working directory remains fixed.
+Existing CLI/environment/overlay usage and v1 display behavior remain supported. The adapter implements SDK 2.1.0's baseline v2 session surface, not every optional draft extension. It does not advertise MCP-over-ACP, additional directories, fork/delete, ACP terminal/filesystem, legacy session/set_mode or slash commands, or elicitation. The primary session working directory remains fixed.
 
 ## Validation
 

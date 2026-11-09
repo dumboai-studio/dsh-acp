@@ -1,31 +1,21 @@
 /** Deterministic provider; all ACP, Agent, tool and persistence code remains real. */
 import { LlmAdapter, ReasoningEffortId, ToolCallId } from '@deepseek-ai/dsh-llm'
-import { watch } from 'node:fs'
+import { setTimeout as delay } from 'node:timers/promises'
 import { access } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
 async function waitForRelease(signal) {
   const path = join(dirname(process.env.DSH_ACP_TEST_FILE), 'release')
-  let watcher
-  let onAbort
-  try {
-    await new Promise((resolve, reject) => {
-      const check = () =>
-        access(path).then(resolve, (error) => {
-          if (error.code !== 'ENOENT') reject(error)
-        })
-      watcher = watch(dirname(path), () => {
-        void check()
-      })
-      watcher.on('error', reject)
-      onAbort = () => reject(new Error('cancelled'))
-      signal.addEventListener('abort', onAbort, { once: true })
-      if (signal.aborted) onAbort()
-      else void check()
-    })
-  } finally {
-    watcher?.close()
-    if (onAbort) signal.removeEventListener('abort', onAbort)
+  // macOS file watchers can miss creation immediately after stream delivery.
+  for (;;) {
+    signal.throwIfAborted()
+    try {
+      await access(path)
+      return
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error
+    }
+    await delay(10, undefined, { signal })
   }
 }
 
@@ -42,6 +32,7 @@ function* callTool(id, name, args) {
 }
 
 class FixtureAdapter extends LlmAdapter {
+  retried = new Set()
   providerInfo() {
     return { id: 'fixture', name: 'Fixture' }
   }
@@ -79,6 +70,31 @@ class FixtureAdapter extends LlmAdapter {
       .map((block) => block.text)
       .join('')
     if (prompt === 'fail') throw new Error('fixture provider failure')
+    if (prompt.startsWith('stream')) {
+      if (prompt === 'stream retry' && !this.retried.has(turn[0].id)) {
+        this.retried.add(turn[0].id)
+        yield { type: 'block-start', index: 0, blockType: 'text' }
+        yield { type: 'text-delta', index: 0, text: 'failed prefix' }
+        throw new Error('fixture stream retry')
+      }
+      yield { type: 'block-start', index: 0, blockType: 'reasoning' }
+      yield { type: 'reasoning-delta', index: 0, text: 'thinking ' }
+      yield { type: 'block-start', index: 1, blockType: 'text' }
+      yield { type: 'text-delta', index: 1, text: 'hello ' }
+      if (prompt === 'stream gate' || prompt === 'stream cancel' || prompt === 'stream fail')
+        await waitForRelease(options.signal)
+      if (prompt === 'stream fail') throw new Error('fixture stream failure')
+      yield { type: 'reasoning-delta', index: 0, text: 'done' }
+      yield { type: 'text-delta', index: 1, text: 'world' }
+      yield { type: 'block-end', index: 0, block: { type: 'reasoning', text: 'thinking done' } }
+      yield { type: 'block-end', index: 1, block: { type: 'text', text: 'hello world' } }
+      // Providers may deliver a complete block without emitting deltas first.
+      yield { type: 'block-start', index: 2, blockType: 'text' }
+      yield { type: 'block-end', index: 2, block: { type: 'text', text: '!' } }
+      yield { type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+      return
+    }
     if (prompt.startsWith('plan')) {
       const completed = turn.filter((message) => message.role === 'tool').length
       if (completed === 0) {
@@ -116,6 +132,13 @@ class FixtureAdapter extends LlmAdapter {
       return
     }
     const tool = turn.find((message) => message.role === 'tool')
+    if (!tool && prompt.startsWith('write ')) {
+      yield* callTool(ToolCallId('fixture-write'), 'write', {
+        file_path: process.env.DSH_ACP_TEST_FILE,
+        content: prompt.slice('write '.length),
+      })
+      return
+    }
     if (!tool) {
       const id = ToolCallId(`fixture-${prompt}`)
       yield { type: 'block-start', index: 0, blockType: 'tool-call' }
@@ -169,6 +192,10 @@ export const name = 'fixture-llm'
 export const inject = ['llm']
 export function apply(ctx) {
   ctx.effect(() => ctx.llm.registerAdapter(['fixture'], new FixtureAdapter()))
+  ctx.on('agent/request-error', (request, next) => {
+    if (request.failure.message === 'fixture stream retry') return { kind: 'retry' }
+    return next()
+  })
   ctx.on('tools/pre-execute', async (exec, next) => {
     if (exec.name !== 'mcp__fixture__add') return next()
     return { kind: 'ask', reason: 'fixture approval' }

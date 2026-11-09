@@ -1,14 +1,14 @@
 /** Experimental ACP v2 handlers over the shared Harness runtime, without a v1 relay. */
 import * as acp from '@agentclientprotocol/sdk/experimental/v2'
 import type { HarnessRuntime, SessionSetup } from '../harness/runtime.js'
-import type { ModelOption, PromptContent, RuntimeOutput, StopReason } from '../harness/types.js'
+import type { ConfigOption, PromptContent, RuntimeOutput, StopReason } from '../harness/types.js'
 import type { Session } from '@deepseek-ai/dsh-session'
 import { toolKind } from '../projector.js'
 import { VERSION } from '../version.js'
 import { untilAborted } from '../harness/abort.js'
 import { messageContent, permissionOptions, toolInput, toolResult, usage, wire } from './shared.js'
 
-function v2Config(options: ModelOption[]): acp.SessionConfigOption[] {
+function v2Config(options: ConfigOption[]): acp.SessionConfigOption[] {
   return options.map(({ id, ...option }): acp.SessionConfigOption => {
     if (option.type === 'boolean') return { ...option, configId: id }
     return {
@@ -109,6 +109,19 @@ function output(
     },
     async send(session, update) {
       const send = (value: acp.SessionUpdate) => notify(session.id, value)
+      if (update.type === 'chunk') {
+        const content = { type: 'text' as const, text: update.text }
+        await send(
+          update.kind === 'text'
+            ? { sessionUpdate: 'agent_message_chunk', messageId: update.messageId, content }
+            : {
+                sessionUpdate: 'agent_thought_chunk',
+                messageId: `${update.messageId}:thought`,
+                content,
+              },
+        )
+        return
+      }
       if (update.type === 'state') {
         const state = update.activity
         if (state.state === 'running') {
@@ -157,9 +170,10 @@ function output(
       const event = update.event
       if (
         event.type === 'assistant/message' ||
+        event.type === 'assistant/attempt' ||
         (event.type === 'user/message' && event.data.source.kind === 'user')
       ) {
-        const message = await messageContent(runtime.ctx, event)
+        const message = await messageContent(runtime.ctx, event, update.assistant)
         if (event.type === 'user/message') {
           await send({
             sessionUpdate: 'user_message',
@@ -168,19 +182,19 @@ function output(
           })
           return
         }
-        if (message.thoughts.length > 0)
+        if (message.thoughts.length > 0 || update.assistant?.reasoning)
           await send({
             sessionUpdate: 'agent_thought',
-            messageId: message.messageId,
+            messageId: `${message.messageId}:thought`,
             content: message.thoughts,
           })
-        if (message.content.length > 0)
+        if (message.content.length > 0 || update.assistant?.text)
           await send({
             sessionUpdate: 'agent_message',
             messageId: message.messageId,
             content: message.content,
           })
-        if (!update.replay) {
+        if (!update.replay && event.type === 'assistant/message') {
           const value = usage(runtime.ctx, session, event)
           if (value !== undefined) await send(value)
         }

@@ -54,11 +54,11 @@ Installing `dsh-acp` automatically installs Harness. No separate `dsh` installat
 1. Install Node.js **24.9.0 or later**, then run:
 
    ```sh
-   npm install -g @dumbo-ai/dsh-acp@0.7.1
+   npm install -g @dumbo-ai/dsh-acp@0.8.0
    dsh-acp --version
    ```
 
-   The version command should print `0.7.1`. The package installs its Harness dependencies.
+   The version command should print `0.8.0`. The package installs its Harness dependencies.
 
 2. Add a custom ACP agent to your client. Set the command to `dsh-acp`, leave its arguments empty and set `DEEPSEEK_API_KEY` in the agent process environment. For Dumbo, merge the following `dsh` entry into `acp-agent-config.json`:
 
@@ -77,7 +77,7 @@ Installing `dsh-acp` automatically installs Harness. No separate `dsh` installat
 
 3. Restart the client, open your project directory, select the agent and send a message. If the client cannot find the executable, run `command -v dsh-acp` in your shell and use the absolute path as the command. Starting `dsh-acp` directly in a terminal leaves it waiting for a protocol message on standard input.
 
-To try the adapter without a global install, set the client command to `npx` and its arguments to `["--yes", "@dumbo-ai/dsh-acp@0.7.1"]`.
+To try the adapter without a global install, set the client command to `npx` and its arguments to `["--yes", "@dumbo-ai/dsh-acp@0.8.0"]`.
 
 ## Models and environment
 
@@ -101,6 +101,10 @@ You can pass `--patch` more than once. A patch replaces the target entry’s ent
 
 ## Sessions, tools and protocol versions
 
+Clients that support ACP configuration can select a permission preset for each session. The default profile offers `read-only`, `workspace-write` and `danger-full-access`. Changes update the session's sandbox and approval policy and are saved for reopening. Custom profiles supply their own preset labels and choices, and clients receive updates when the choices or current permissions change. A `custom` current value describes saved settings that match no available preset.
+
+Harness enforces the selected policy. In particular, `danger-full-access` disables approval prompts, and tools that explicitly require approval are rejected under that policy.
+
 The client negotiates ACP v1 or experimental v2 at startup. Both use the same Harness runtime. Clients can list sessions, resume a session in its original project directory, cancel work or close a session. Each session can use client-supplied stdio or HTTP MCP servers. When a tool needs approval, the client offers a one-time allow or reject choice.
 
 | Client operation                | ACP v1                                 | Experimental ACP v2                                                                       |
@@ -111,9 +115,9 @@ The client negotiates ACP v1 or experimental v2 at startup. Both use the same Ha
 
 If you switch models or reasoning effort during a turn, the new choice applies to the next turn. You can reopen ordinary conversation forks created in 0.7.0 from the history list.
 
-Session titles come from Harness and appear in updates and history listings when available. Tool updates carry a category, status and result. Plans come from the model’s task tool and clear at the start of the next turn. Text and reasoning arrive when Harness commits a message, so clients may receive a whole block at once. Image input depends on the model and Harness configuration. Audio, embedded context, MCP-over-ACP, client file operations and terminal views are currently unsupported.
+Session titles come from Harness and appear in updates and history listings when available. Tool updates carry a category, status and result. Plans come from the model’s task tool and clear at the start of the next turn. Text and reasoning stream as Harness produces them. Completion does not append the same text again. Cancelled or failed attempts retain their delivered prefix; retries use a separate message. V2 history replay restores those messages from the session log. Image input depends on the model and Harness configuration. Audio, embedded context, MCP-over-ACP, client file operations and terminal views are currently unsupported.
 
-ACP v2 uses the experimental entrypoint in ACP SDK `2.1.0`; it is not a claim of a stable v2 specification. Cancellation and completion wait for the Harness turn to finish before admitting the next prompt. See the [protocol validation results](docs/releases/0.7.1.md) for tested behavior and limits.
+ACP v2 uses the experimental entrypoint in ACP SDK `2.1.0`; it is not a claim of a stable v2 specification. Cancellation and completion wait for the Harness turn to finish before admitting the next prompt. See the [protocol validation results](docs/releases/0.8.0.md) for tested behavior and limits.
 
 ## Run from source
 

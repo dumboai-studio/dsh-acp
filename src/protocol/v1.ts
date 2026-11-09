@@ -45,6 +45,14 @@ function output(
     },
     async send(session, update) {
       const send = (value: SessionUpdate) => notify(session.id, value)
+      if (update.type === 'chunk') {
+        await send({
+          sessionUpdate: update.kind === 'text' ? 'agent_message_chunk' : 'agent_thought_chunk',
+          messageId: update.messageId + (update.kind === 'reasoning' ? ':thought' : ''),
+          content: { type: 'text', text: update.text },
+        })
+        return
+      }
       if (update.type === 'state') return
       if (update.type === 'title') {
         const value = titleUpdate(update.title)
@@ -60,12 +68,12 @@ function output(
         return
       }
       const event = update.event
-      if (event.type === 'assistant/message') {
-        const message = await messageContent(runtime.ctx, event)
+      if (event.type === 'assistant/message' || event.type === 'assistant/attempt') {
+        const message = await messageContent(runtime.ctx, event, update.assistant, true)
         for (const content of message.thoughts)
           await send({
             sessionUpdate: 'agent_thought_chunk',
-            messageId: message.messageId,
+            messageId: `${message.messageId}:thought`,
             content,
           })
         for (const content of message.content)
@@ -74,7 +82,8 @@ function output(
             messageId: message.messageId,
             content,
           })
-        const value = usage(runtime.ctx, session, event)
+        const value =
+          event.type === 'assistant/message' ? usage(runtime.ctx, session, event) : undefined
         if (value !== undefined) await send(value)
       } else if (event.type === 'tool/call') {
         await send({

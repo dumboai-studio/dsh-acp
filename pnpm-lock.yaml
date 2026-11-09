@@ -32,6 +32,9 @@ importers:
       '@deepseek-ai/dsh-mcp-client':
         specifier: 0.2.2-rc.1
         version: 0.2.2-rc.1(f493aa6df3539275aa669c2bcea3e03a)
+      '@deepseek-ai/dsh-permission-presets':
+        specifier: 0.2.2-rc.1
+        version: 0.2.2-rc.1(5c469c99cbb4811e2bfdb6e5acb3d5df)
       '@deepseek-ai/dsh-session':
         specifier: 0.2.2-rc.1
         version: 0.2.2-rc.1(@deepseek-ai/cordis@4.1.0)(@deepseek-ai/dsh-scope@0.2.2-rc.1(@deepseek-ai/cordis@4.1.0))

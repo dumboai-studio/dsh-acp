@@ -44,6 +44,10 @@ export class HarnessRuntime {
       const record = this.records.get(session.id)
       if (record?.session === session) record.onEvent(event)
     })
+    ctx.on('agent/assistant-stream', ({ agent, frame }) => {
+      const record = this.records.get(agent.session.id)
+      if (record?.agent === agent) record.onStream(frame)
+    })
     ctx.on('agent/error', ({ agent, error }) => {
       const record = this.records.get(agent.session.id)
       if (record?.agent === agent) record.onError(error)
@@ -59,7 +63,10 @@ export class HarnessRuntime {
       }),
     )
     ctx.on('llm/adapters-updated', () => {
-      for (const record of this.records.values()) record.topologyChanged()
+      for (const record of this.records.values()) record.configurationChanged()
+    })
+    ctx.on('permission-presets/catalog-changed', () => {
+      for (const record of this.records.values()) record.configurationChanged()
     })
     ctx.on('approval/request', (request, next) => {
       const record = this.records.get(request.agent.session.id)

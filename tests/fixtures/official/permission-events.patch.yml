@@ -1,0 +1,3 @@
+- insert:
+    - id: fixture-permission-events
+      name: './permission-events.mjs'

@@ -28,7 +28,7 @@ const mcpServers: McpServer[] = [
   { name: 'fixture', command: process.execPath, args: [mcp], env: [] },
 ]
 
-function launch(cwd: string, patches: string[] = []) {
+function launch(cwd: string, patches: string[] = [], permissionMode = 'read-only') {
   const args = [bin, '--patch', patch, ...patches.flatMap((path) => ['--patch', path])]
   const child = spawn(process.execPath, args, {
     cwd,
@@ -40,7 +40,7 @@ function launch(cwd: string, patches: string[] = []) {
       DSH_ACP_TEST_SESSIONS: join(cwd, '.sessions'),
       DSH_ACP_TEST_FILE: join(cwd, 'fixture.txt'),
       DSH_TELEMETRY_DISABLED: '1',
-      DSH_PERMISSION_MODE: 'read-only',
+      DSH_PERMISSION_MODE: permissionMode,
     },
     stdio: ['pipe', 'pipe', 'pipe'],
   })
@@ -82,12 +82,17 @@ function launch(cwd: string, patches: string[] = []) {
     notifications,
     permissions,
     waitForUpdate(predicate: (update: SessionUpdate) => boolean) {
-      return new Promise<void>((resolve) => {
+      return new Promise<void>((resolve, reject) => {
         const listener = (update: SessionUpdate) => {
           if (!predicate(update)) return
           listeners.delete(listener)
+          clearTimeout(timer)
           resolve()
         }
+        const timer = setTimeout(() => {
+          listeners.delete(listener)
+          reject(new Error(`v1 event timeout: ${diagnostics.join('')}\n${JSON.stringify(updates)}`))
+        }, 8_000)
         listeners.add(listener)
       })
     },
@@ -134,6 +139,153 @@ function reply(updates: SessionUpdate[]): string {
 }
 
 describe('direct Harness ACP v1 compatibility', () => {
+  it('streams before completion, changes permissions mid-stream and resumes without duplicate text', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'dsh-acp-v1-stream-'))
+    let server = launch(cwd)
+    try {
+      const initialize = () =>
+        server.agent.request(methods.agent.initialize, {
+          protocolVersion: 1,
+          clientCapabilities: {},
+        })
+      await initialize()
+      const { sessionId } = await server.agent.request(methods.agent.session.new, {
+        cwd,
+        mcpServers,
+      })
+      const prefix = server.waitForUpdate(
+        (update) =>
+          update.sessionUpdate === 'agent_message_chunk' &&
+          update.content.type === 'text' &&
+          update.content.text === 'hello ',
+      )
+      let completed = false
+      const pending = server.agent
+        .request(methods.agent.session.prompt, {
+          sessionId,
+          prompt: [{ type: 'text', text: 'stream gate' }],
+        })
+        .then((result) => {
+          completed = true
+          return result
+        })
+      await prefix
+      expect(completed).toBe(false)
+      expect(reply(server.updates)).toBe('hello ')
+      const permissions = await server.agent.request(methods.agent.session.setConfigOption, {
+        sessionId,
+        configId: 'mode',
+        value: 'workspace-write',
+      })
+      expect(permissions.configOptions).toContainEqual(
+        expect.objectContaining({ id: 'mode', currentValue: 'workspace-write' }),
+      )
+      await writeFile(join(cwd, 'release'), '')
+      expect(await pending).toEqual({ stopReason: 'end_turn' })
+      expect(reply(server.updates)).toBe('hello world!')
+      expect(
+        server.updates
+          .flatMap((update) =>
+            update.sessionUpdate === 'agent_thought_chunk' && update.content.type === 'text'
+              ? [update.content.text]
+              : [],
+          )
+          .join(''),
+      ).toBe('thinking done')
+      const messageIds = new Set(
+        server.updates.flatMap((update) =>
+          update.sessionUpdate === 'agent_message_chunk' ? [update.messageId] : [],
+        ),
+      )
+      expect(messageIds.size).toBe(1)
+      expect(
+        server.updates.filter((update) => update.sessionUpdate === 'usage_update'),
+      ).toHaveLength(1)
+      await server.finish()
+      server = launch(cwd)
+      await initialize()
+      const resumed = await server.agent.request(methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        mcpServers,
+      })
+      expect(resumed.configOptions).toContainEqual(
+        expect.objectContaining({ id: 'mode', currentValue: 'workspace-write' }),
+      )
+      expect(reply(server.updates)).toBe('')
+      await server.agent.request(methods.agent.session.prompt, {
+        sessionId,
+        prompt: [{ type: 'text', text: 'stream next' }],
+      })
+      expect(reply(server.updates)).toBe('hello world!')
+      for (const update of server.updates)
+        if (update.sessionUpdate === 'agent_message_chunk')
+          expect(messageIds.has(update.messageId)).toBe(false)
+      await server.finish()
+    } finally {
+      await server.stop()
+      await rm(cwd, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  it.each(['cancel', 'fail', 'retry'] as const)(
+    'settles a %s mid-stream before accepting the next v1 prompt',
+    async (scenario) => {
+      const cwd = await mkdtemp(join(tmpdir(), 'dsh-acp-v1-stream-outcome-'))
+      const server = launch(cwd)
+      try {
+        await server.agent.request(methods.agent.initialize, {
+          protocolVersion: 1,
+          clientCapabilities: {},
+        })
+        const { sessionId } = await server.agent.request(methods.agent.session.new, {
+          cwd,
+          mcpServers,
+        })
+        const prefix = server.waitForUpdate(
+          (update) => update.sessionUpdate === 'agent_message_chunk',
+        )
+        const pending = server.agent.request(methods.agent.session.prompt, {
+          sessionId,
+          prompt: [{ type: 'text', text: `stream ${scenario}` }],
+        })
+        const outcome = pending.then(
+          (result) => result.stopReason,
+          () => 'error',
+        )
+        await prefix
+        if (scenario === 'cancel')
+          await server.agent.notify(methods.agent.session.cancel, { sessionId })
+        if (scenario === 'fail') await writeFile(join(cwd, 'release'), '')
+        expect(await outcome).toBe(
+          scenario === 'cancel' ? 'cancelled' : scenario === 'fail' ? 'error' : 'end_turn',
+        )
+        expect(reply(server.updates)).toBe(
+          scenario === 'retry' ? 'failed prefixhello world!' : 'hello ',
+        )
+        const ids = new Set(
+          server.updates.flatMap((update) =>
+            update.sessionUpdate === 'agent_message_chunk' ? [update.messageId] : [],
+          ),
+        )
+        expect(ids.size).toBe(scenario === 'retry' ? 2 : 1)
+        const start = server.updates.length
+        expect(
+          await server.agent.request(methods.agent.session.prompt, {
+            sessionId,
+            prompt: [{ type: 'text', text: 'stream next' }],
+          }),
+        ).toEqual({ stopReason: 'end_turn' })
+        expect(reply(server.updates.slice(start))).toBe('hello world!')
+        await server.finish()
+      } finally {
+        await server.stop()
+        await rm(cwd, { recursive: true, force: true })
+      }
+    },
+    30_000,
+  )
+
   it('publishes plans, titles and tool categories by default and restores display after restart', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'dsh-acp-display-'))
     await writeFile(join(cwd, 'fixture.txt'), 'fixture content')
@@ -297,7 +449,7 @@ describe('direct Harness ACP v1 compatibility', () => {
 
   it('lists and resumes a 0.7.0 fork while keeping subagent sessions private', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'dsh-acp-legacy-fork-'))
-    const server = launch(cwd)
+    const server = launch(cwd, [], 'danger-full-access')
     try {
       await server.agent.request(methods.agent.initialize, {
         protocolVersion: 1,
@@ -330,13 +482,14 @@ describe('direct Harness ACP v1 compatibility', () => {
       expect(await server.agent.request(methods.agent.session.list, { cwd })).toEqual({
         sessions: [{ sessionId: 'legacy-fork', cwd }],
       })
-      await expect(
-        server.agent.request(methods.agent.session.resume, {
-          sessionId: 'legacy-fork',
-          cwd,
-          mcpServers: [],
-        }),
-      ).resolves.toHaveProperty('configOptions')
+      const resumed = await server.agent.request(methods.agent.session.resume, {
+        sessionId: 'legacy-fork',
+        cwd,
+        mcpServers: [],
+      })
+      expect(resumed.configOptions).toContainEqual(
+        expect.objectContaining({ id: 'mode', currentValue: 'read-only' }),
+      )
       await expect(
         server.agent.request(methods.agent.session.resume, {
           sessionId: 'legacy-subagent',
@@ -351,66 +504,219 @@ describe('direct Harness ACP v1 compatibility', () => {
     }
   }, 30_000)
 
-  it('closes active work without disturbing another session or leaking display updates', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'dsh-acp-isolation-'))
-    await writeFile(join(cwd, 'fixture.txt'), 'fixture content')
-    const process = launch(cwd)
+  it.each(['cancel', 'stream cancel'])(
+    'closes %s without disturbing another session or leaking display updates',
+    async (prompt) => {
+      const cwd = await mkdtemp(join(tmpdir(), 'dsh-acp-isolation-'))
+      await writeFile(join(cwd, 'fixture.txt'), 'fixture content')
+      const process = launch(cwd)
+      try {
+        await process.agent.request(methods.agent.initialize, {
+          protocolVersion: 1,
+          clientCapabilities: {},
+        })
+        const a = await process.agent.request(methods.agent.session.new, { cwd, mcpServers })
+        const b = await process.agent.request(methods.agent.session.new, { cwd, mcpServers })
+        const busy = process.waitForUpdate((update) =>
+          prompt === 'stream cancel'
+            ? update.sessionUpdate === 'agent_message_chunk' &&
+              update.content.type === 'text' &&
+              update.content.text === 'hello '
+            : update.sessionUpdate === 'tool_call_update' && update.toolCallId === 'fixture-cancel',
+        )
+        const promptA = process.agent.request(methods.agent.session.prompt, {
+          sessionId: a.sessionId,
+          prompt: [{ type: 'text', text: prompt }],
+        })
+        const promptB = process.agent.request(methods.agent.session.prompt, {
+          sessionId: b.sessionId,
+          prompt: [{ type: 'text', text: 'plan independent task' }],
+        })
+        await busy
+        await process.agent.request(methods.agent.session.close, { sessionId: a.sessionId })
+        await expect(promptA).resolves.toEqual({ stopReason: 'cancelled' })
+        await expect(promptB).resolves.toEqual({ stopReason: 'end_turn' })
+        const before = process.notifications.filter(({ sessionId }) => sessionId === a.sessionId)
+        await process.agent.request(methods.agent.session.prompt, {
+          sessionId: b.sessionId,
+          prompt: [{ type: 'text', text: 'continue' }],
+        })
+        expect(process.notifications.filter(({ sessionId }) => sessionId === a.sessionId)).toEqual(
+          before,
+        )
+        const titles = process.notifications.filter(
+          ({ update }) => update.sessionUpdate === 'session_info_update',
+        )
+        expect(titles).toContainEqual({
+          sessionId: a.sessionId,
+          update: { sessionUpdate: 'session_info_update', title: prompt },
+        })
+        expect(titles).toContainEqual({
+          sessionId: b.sessionId,
+          update: { sessionUpdate: 'session_info_update', title: 'plan independent task' },
+        })
+        expect(
+          process.notifications
+            .filter(
+              ({ sessionId, update }) =>
+                sessionId === a.sessionId && update.sessionUpdate === 'plan',
+            )
+            .every(({ update }) => update.sessionUpdate === 'plan' && update.entries.length === 0),
+        ).toBe(true)
+        // EOF also owns teardown of the second, still-open session.
+        await process.finish()
+      } finally {
+        await process.stop()
+        await rm(cwd, { recursive: true, force: true })
+      }
+    },
+    30_000,
+  )
+  it('keeps model configuration available when a custom profile omits permission presets', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'dsh-acp-no-presets-'))
+    const patch = join(cwd, 'no-presets.yml')
+    await writeFile(patch, '- id: permission\n  disabled: true\n')
+    const server = launch(cwd, [patch])
     try {
-      await process.agent.request(methods.agent.initialize, {
+      await server.agent.request(methods.agent.initialize, {
         protocolVersion: 1,
         clientCapabilities: {},
       })
-      const a = await process.agent.request(methods.agent.session.new, { cwd, mcpServers })
-      const b = await process.agent.request(methods.agent.session.new, { cwd, mcpServers })
-      const busy = process.waitForUpdate(
-        (update) =>
-          update.sessionUpdate === 'tool_call_update' && update.toolCallId === 'fixture-cancel',
-      )
-      const promptA = process.agent.request(methods.agent.session.prompt, {
-        sessionId: a.sessionId,
-        prompt: [{ type: 'text', text: 'cancel' }],
-      })
-      const promptB = process.agent.request(methods.agent.session.prompt, {
-        sessionId: b.sessionId,
-        prompt: [{ type: 'text', text: 'plan independent task' }],
-      })
-      await busy
-      await process.agent.request(methods.agent.session.close, { sessionId: a.sessionId })
-      await expect(promptA).resolves.toEqual({ stopReason: 'cancelled' })
-      await expect(promptB).resolves.toEqual({ stopReason: 'end_turn' })
-      const before = process.notifications.filter(({ sessionId }) => sessionId === a.sessionId)
-      await process.agent.request(methods.agent.session.prompt, {
-        sessionId: b.sessionId,
-        prompt: [{ type: 'text', text: 'continue' }],
-      })
-      expect(process.notifications.filter(({ sessionId }) => sessionId === a.sessionId)).toEqual(
-        before,
-      )
-      const titles = process.notifications.filter(
-        ({ update }) => update.sessionUpdate === 'session_info_update',
-      )
-      expect(titles).toContainEqual({
-        sessionId: a.sessionId,
-        update: { sessionUpdate: 'session_info_update', title: 'cancel' },
-      })
-      expect(titles).toContainEqual({
-        sessionId: b.sessionId,
-        update: { sessionUpdate: 'session_info_update', title: 'plan independent task' },
-      })
-      expect(
-        process.notifications
-          .filter(
-            ({ sessionId, update }) => sessionId === a.sessionId && update.sessionUpdate === 'plan',
-          )
-          .every(({ update }) => update.sessionUpdate === 'plan' && update.entries.length === 0),
-      ).toBe(true)
-      // EOF also owns teardown of the second, still-open session.
-      await process.finish()
+      const session = await server.agent.request(methods.agent.session.new, { cwd, mcpServers: [] })
+      expect(session.configOptions?.map(({ id }) => id)).toEqual(['model', 'reasoning_effort'])
+      await expect(
+        server.agent.request(methods.agent.session.setConfigOption, {
+          sessionId: session.sessionId,
+          configId: 'mode',
+          value: 'danger-full-access',
+        }),
+      ).rejects.toMatchObject({ code: -32602 })
+      await server.finish()
     } finally {
-      await process.stop()
+      await server.stop()
       await rm(cwd, { recursive: true, force: true })
     }
   }, 30_000)
+
+  it('switches real permission presets, preserves them across restart and isolates sessions', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'dsh-acp-v1-presets-'))
+    let server = launch(cwd)
+    try {
+      await server.agent.request(methods.agent.initialize, {
+        protocolVersion: 1,
+        clientCapabilities: {},
+      })
+      const session = await server.agent.request(methods.agent.session.new, { cwd, mcpServers })
+      const other = await server.agent.request(methods.agent.session.new, { cwd, mcpServers: [] })
+      const mode = session.configOptions?.find(({ id }) => id === 'mode')
+      expect(mode).toMatchObject({ type: 'select', category: 'mode', currentValue: 'read-only' })
+      expect(mode?.type === 'select' && mode.options).toEqual([
+        { value: 'read-only', name: 'read-only' },
+        { value: 'workspace-write', name: 'workspace-write' },
+        { value: 'danger-full-access', name: 'danger-full-access' },
+      ])
+      for (const value of ['missing', 'custom', false]) {
+        await expect(
+          server.agent.request(methods.agent.session.setConfigOption, {
+            sessionId: session.sessionId,
+            configId: 'mode',
+            value,
+          }),
+        ).rejects.toMatchObject({ code: -32602 })
+      }
+      const changes = await Promise.all(
+        ['workspace-write', 'danger-full-access'].map((value) =>
+          server.agent.request(methods.agent.session.setConfigOption, {
+            sessionId: session.sessionId,
+            configId: 'mode',
+            value,
+          }),
+        ),
+      )
+      expect(
+        changes.map(
+          ({ configOptions }) => configOptions.find(({ id }) => id === 'mode')?.currentValue,
+        ),
+      ).toEqual(['workspace-write', 'danger-full-access'])
+      const modelChange = await server.agent.request(methods.agent.session.setConfigOption, {
+        sessionId: session.sessionId,
+        configId: 'model',
+        value: selectValue(session.configOptions, 'model', 'beta'),
+      })
+      expect(modelChange.configOptions).toContainEqual(
+        expect.objectContaining({ id: 'mode', currentValue: 'danger-full-access' }),
+      )
+      const otherState = await server.agent.request(methods.agent.session.resume, {
+        sessionId: other.sessionId,
+        cwd,
+        mcpServers: [],
+      })
+      expect(otherState.configOptions).toContainEqual(
+        expect.objectContaining({ id: 'mode', currentValue: 'read-only' }),
+      )
+      const updatedOptions = server.notifications
+        .filter(({ sessionId }) => sessionId === session.sessionId)
+        .flatMap(({ update }) =>
+          update.sessionUpdate === 'config_option_update' ? [update.configOptions] : [],
+        )
+        .at(-1)
+      expect(updatedOptions).toContainEqual(
+        expect.objectContaining({ id: 'mode', currentValue: 'danger-full-access' }),
+      )
+      expect(updatedOptions).toContainEqual(expect.objectContaining({ id: 'model' }))
+      await server.finish()
+      server = launch(cwd)
+      await server.agent.request(methods.agent.initialize, {
+        protocolVersion: 1,
+        clientCapabilities: {},
+      })
+      const resumed = await server.agent.request(methods.agent.session.resume, {
+        sessionId: session.sessionId,
+        cwd,
+        mcpServers,
+      })
+      expect(resumed.configOptions).toContainEqual(
+        expect.objectContaining({ id: 'mode', currentValue: 'danger-full-access' }),
+      )
+      await server.agent.request(methods.agent.session.prompt, {
+        sessionId: session.sessionId,
+        prompt: [{ type: 'text', text: 'full access' }],
+      })
+      expect(reply(server.updates)).toContain('the user rejected tool "mcp__fixture__add"')
+      expect(server.permissions).toHaveLength(0)
+      await server.agent.request(methods.agent.session.prompt, {
+        sessionId: session.sessionId,
+        prompt: [{ type: 'text', text: 'write full access' }],
+      })
+      expect(await readFile(join(cwd, 'fixture.txt'), 'utf8')).toBe('full access')
+      expect(server.permissions).toHaveLength(0)
+      await server.agent.request(methods.agent.session.setConfigOption, {
+        sessionId: session.sessionId,
+        configId: 'mode',
+        value: 'read-only',
+      })
+      await server.agent.request(methods.agent.session.prompt, {
+        sessionId: session.sessionId,
+        prompt: [{ type: 'text', text: 'ask again' }],
+      })
+      expect(server.permissions).toHaveLength(1)
+      const beforeWrite = server.updates.length
+      await server.agent.request(methods.agent.session.prompt, {
+        sessionId: session.sessionId,
+        prompt: [{ type: 'text', text: 'write forbidden content' }],
+      })
+      expect(server.permissions).toHaveLength(1)
+      expect(await readFile(join(cwd, 'fixture.txt'), 'utf8')).toBe('full access')
+      expect(server.updates.slice(beforeWrite)).toContainEqual(
+        expect.objectContaining({ sessionUpdate: 'tool_call_update', status: 'failed' }),
+      )
+      await server.finish()
+    } finally {
+      await server.stop()
+      await rm(cwd, { recursive: true, force: true })
+    }
+  }, 30_000)
+
   it('selects models, requests permission, uses MCP, resumes history and continues after cancellation', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'dsh-acp-profile-'))
     let process = launch(cwd)

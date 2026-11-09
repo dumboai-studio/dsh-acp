@@ -2,6 +2,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { RequestError, type ContentBlock } from '@agentclientprotocol/sdk'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
+import { assembleAssistantStream } from '@deepseek-ai/dsh-llm'
 import { assistantBlockToAcp, AcpContentError } from '../harness/content.js'
 import { AcpMcpConfigError } from '../harness/mcp.js'
 import { AcpModelConfigError } from '../harness/model.js'
@@ -14,12 +15,31 @@ export const permissionOptions = [
 
 export async function messageContent(
   ctx: Context,
-  event: SessionEvent<'assistant/message'> | SessionEvent<'user/message'>,
+  event:
+    | SessionEvent<'assistant/message'>
+    | SessionEvent<'assistant/attempt'>
+    | SessionEvent<'user/message'>,
+  delivery?: { messageId: string; streamed: boolean },
+  appendOnly = false,
 ) {
-  const message = event.type === 'user/message' ? event.data : event.data.message
+  const blocks =
+    event.type === 'assistant/attempt'
+      ? assembleAssistantStream(event.data.stream).interruptedBlocks()
+      : event.type === 'user/message'
+        ? event.data.content
+        : event.data.message.content
+  const messageId =
+    delivery?.messageId ??
+    (event.type === 'user/message'
+      ? event.data.id
+      : event.type === 'assistant/message'
+        ? event.data.message.id
+        : `attempt:${event.seq}`)
   const content: ContentBlock[] = []
   const thoughts: ContentBlock[] = []
-  for (const block of message.content) {
+  for (const block of blocks) {
+    if (appendOnly && delivery?.streamed && (block.type === 'text' || block.type === 'reasoning'))
+      continue
     if (block.type === 'reasoning') {
       if (block.text.length > 0) thoughts.push({ type: 'text', text: block.text })
     } else {
@@ -27,7 +47,7 @@ export async function messageContent(
       if (converted !== undefined) content.push(converted)
     }
   }
-  return { messageId: message.id, content, thoughts }
+  return { messageId, content, thoughts }
 }
 
 export async function toolResult(ctx: Context, event: SessionEvent<'tool/result'>) {

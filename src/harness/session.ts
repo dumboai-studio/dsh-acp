@@ -1,18 +1,24 @@
 /** Direct Harness session ownership, queued admission and quiescent completion. */
 import type { Context } from '@deepseek-ai/cordis'
 import { RequestError } from '@agentclientprotocol/sdk'
-import type { Agent, AgentHandle, AgentStatus } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentHandle, AgentStatus, AssistantStreamFrame } from '@deepseek-ai/dsh-agent'
 import { createUserMessage, errorChain } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent, TurnEndReason } from '@deepseek-ai/dsh-session'
 import type { TodoItem } from '@deepseek-ai/dsh-tool-todo'
 import { AcpContentError, admitAcpPrompt } from './content.js'
 import { AcpModelControl } from './model.js'
+import { AssistantStream } from './stream.js'
+import {
+  PERMISSION_CONFIG_ID,
+  permissionConfigOptions,
+  setPermissionConfig,
+} from './permissions.js'
 import { untilAborted } from './abort.js'
 import type { McpMount } from './mcp.js'
 import type {
   Activity,
   McpConfiguration,
-  ModelOption,
+  ConfigOption,
   Outcome,
   PromptContent,
   RuntimeOutput,
@@ -43,6 +49,7 @@ export interface PromptOperation {
 export class HarnessSession {
   readonly agent: Agent
   private readonly model: AcpModelControl
+  private optionTail = Promise.resolve()
   private tail = Promise.resolve()
   private readonly queue: Submission[] = []
   private current: Submission | undefined
@@ -61,6 +68,7 @@ export class HarnessSession {
   private buffered: RuntimeUpdate[] | undefined
   private configurationTail = Promise.resolve()
   private readonly lifetime = new AbortController()
+  private readonly stream = new AssistantStream()
 
   constructor(
     private readonly ctx: Context,
@@ -81,13 +89,34 @@ export class HarnessSession {
     this.ready = true
   }
 
-  configOptions(signal?: AbortSignal): Promise<ModelOption[]> {
-    return this.model.options(signal)
+  async configOptions(signal?: AbortSignal): Promise<ConfigOption[]> {
+    return [
+      ...(await this.model.options(signal)),
+      ...permissionConfigOptions(this.ctx, this.session),
+    ]
   }
 
-  setConfig(id: string, value: unknown, signal: AbortSignal): Promise<ModelOption[]> {
+  setConfig(id: string, value: unknown, requestSignal: AbortSignal): Promise<ConfigOption[]> {
     this.assertOpen()
-    return this.model.set(id, value, AbortSignal.any([signal, this.lifetime.signal]))
+    const signal = AbortSignal.any([requestSignal, this.lifetime.signal])
+    const operation = this.optionTail.then(async () => {
+      signal.throwIfAborted()
+      if (id === PERMISSION_CONFIG_ID) {
+        setPermissionConfig(this.ctx, this.session, value)
+        await this.ctx.sessions.flush(this.session)
+        signal.throwIfAborted()
+        return this.configOptions(signal)
+      }
+      return [
+        ...(await this.model.set(id, value, signal)),
+        ...permissionConfigOptions(this.ctx, this.session),
+      ]
+    })
+    this.optionTail = operation.then(
+      () => undefined,
+      () => undefined,
+    )
+    return operation
   }
 
   replaceMcp(servers: readonly McpConfiguration[], requestSignal: AbortSignal): Promise<void> {
@@ -322,7 +351,11 @@ export class HarnessSession {
       this.ended = event.data.reason
       this.agentError = undefined
     }
-    void this.enqueue({ type: 'event', event, replay: false })
+    const assistant =
+      event.type === 'assistant/message' || event.type === 'assistant/attempt'
+        ? this.stream.event(event)
+        : undefined
+    void this.enqueue({ type: 'event', event, replay: false, assistant })
     if (event.type === 'tool/call') this.activeTools.add(event.data.callId)
     if (event.type === 'tool/result') {
       this.activeTools.delete(event.data.message.toolCallId)
@@ -332,6 +365,12 @@ export class HarnessSession {
 
   onError(error: unknown): void {
     this.agentError = toError(error)
+  }
+
+  onStream(frame: AssistantStreamFrame): void {
+    if (!this.ready) return
+    const chunk = this.stream.frame(frame)
+    if (chunk !== undefined) void this.enqueue(chunk)
   }
 
   onStatus(status: AgentStatus): void {
@@ -357,6 +396,7 @@ export class HarnessSession {
 
   projection(key: string, value: unknown): void {
     if (!this.ready || this.closing !== undefined) return
+    if (key === 'permissions') this.configurationChanged()
     if (key === 'title') void this.enqueue({ type: 'title', title: value as string | null })
     if (key === 'todos')
       void this.enqueue({ type: 'plan', todos: value as readonly TodoItem[] | null })
@@ -386,9 +426,14 @@ export class HarnessSession {
             signal,
           })
           const { events } = await handle.read(0, through, { signal })
+          const replayStream = new AssistantStream()
           for (const event of events) {
             signal.throwIfAborted()
-            await send({ type: 'event', event, replay: true })
+            const assistant =
+              event.type === 'assistant/message' || event.type === 'assistant/attempt'
+                ? replayStream.event(event)
+                : undefined
+            await send({ type: 'event', event, replay: true, assistant })
           }
         }
         await drain()
@@ -443,7 +488,7 @@ export class HarnessSession {
     if (state !== this.activity.state) await this.setActivity({ state })
   }
 
-  topologyChanged(): void {
+  configurationChanged(): void {
     void this.configOptions(this.lifetime.signal)
       .then((options) => {
         if (this.ready && this.closing === undefined)
@@ -451,7 +496,7 @@ export class HarnessSession {
       })
       .catch((error: unknown) => {
         if (this.closing === undefined)
-          this.ctx.logger.warn(`dsh-acp: model discovery failed: ${errorChain(error)}`)
+          this.ctx.logger.warn(`dsh-acp: configuration refresh failed: ${errorChain(error)}`)
       })
   }
 
@@ -494,6 +539,7 @@ export class HarnessSession {
     for (const operation of [
       async () => {
         await this.pump
+        await this.optionTail
         await this.configurationTail
         await this.autonomous
         await this.agent.whenIdle()
