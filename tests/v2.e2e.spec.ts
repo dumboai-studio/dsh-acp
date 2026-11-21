@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable, Writable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
-import * as acp from '@agentclientprotocol/sdk/experimental/v2'
+import * as acp from '@agentclientprotocol/sdk/experimental/v2/unstable'
 import { describe, expect, it } from 'vitest'
 
 const bin =
@@ -54,6 +54,7 @@ function launch(cwd: string, permissions: 'allow' | 'hold' = 'allow', patches: s
   const requests: acp.RequestPermissionRequest[] = []
   const permissionGate = Promise.withResolvers<undefined>()
   const listeners = new Set<() => void>()
+  const mcpProvider = new acp.McpOverAcpProvider()
   const connection = acp
     .client({ name: 'v2-test' })
     .onNotification(acp.methods.client.session.update, ({ params }) => {
@@ -67,6 +68,7 @@ function launch(cwd: string, permissions: 'allow' | 'hold' = 'allow', patches: s
       if (permissions === 'hold') await permissionGate.promise
       return { outcome: { outcome: 'selected', optionId: 'allow-once' } }
     })
+    .onRequest(acp.methods.client.mcp.message, mcpProvider.handleRequest)
     .connect(
       acp.ndJsonStream(
         Writable.toWeb(child.stdin) as WritableStream<Uint8Array>,
@@ -93,6 +95,8 @@ function launch(cwd: string, permissions: 'allow' | 'hold' = 'allow', patches: s
     agent: connection.agent,
     notifications,
     requests,
+    exposeMcp: (options: Parameters<typeof mcpProvider.registerServer>[1]) =>
+      mcpProvider.registerServer(connection.agent, options),
     allowPermissions: () => permissionGate.resolve(undefined),
     assertStateBeforeResponse() {
       const frames: {
@@ -118,7 +122,8 @@ function launch(cwd: string, permissions: 'allow' | 'hold' = 'allow', patches: s
         capabilities: {},
       })
     },
-    newSession: () => connection.agent.request(acp.methods.agent.session.new, { cwd, mcpServers }),
+    newSession: (servers = mcpServers) =>
+      connection.agent.request(acp.methods.agent.session.new, { cwd, mcpServers: servers }),
     prompt: (sessionId: string, text: string, signal?: AbortSignal) =>
       connection.agent.request(
         acp.methods.agent.session.prompt,
@@ -204,6 +209,125 @@ function assistantMessages(updates: acp.UpdateSessionNotification[]): Map<string
 }
 
 describe('direct Harness ACP v2', () => {
+  it('deduplicates concurrent prompt retries and recognizes the same key after restart', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'dsh-acp-prompt-key-'))
+    let server = launch(cwd)
+    try {
+      await server.initialize()
+      const { sessionId } = await server.newSession([])
+      const request = {
+        sessionId,
+        idempotencyKey: 'fixture-original-prompt',
+        prompt: [{ type: 'text' as const, text: 'stream gate' }],
+      }
+      const send = () => server.agent.request(acp.methods.agent.session.prompt, request)
+      const [original, duplicate] = await Promise.all([send(), send()])
+      expect(duplicate).toEqual(original)
+      expect(original.messageId).not.toContain(request.idempotencyKey)
+      await writeFile(join(cwd, 'release'), '')
+      await server.idle(sessionId)
+      expect(
+        server.notifications.filter(({ update }) => update.sessionUpdate === 'user_message'),
+      ).toHaveLength(1)
+      await server.finish()
+
+      server = launch(cwd)
+      await server.initialize()
+      await server.agent.request(acp.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        mcpServers: [],
+        replayFrom: { type: 'start' },
+      })
+      const replay = server.notifications.map(({ update }) => update)
+      const marker = replay.findIndex((update) => update.sessionUpdate === 'replay_complete')
+      expect(marker).toBeGreaterThan(0)
+      expect(replay.filter((update) => update.sessionUpdate === 'replay_complete')).toHaveLength(1)
+      expect(replay.slice(0, marker)).toContainEqual(
+        expect.objectContaining({ sessionUpdate: 'user_message', messageId: original.messageId }),
+      )
+      expect(
+        replay.slice(0, marker).some((update) => update.sessionUpdate === 'state_update'),
+      ).toBe(false)
+      expect(replay.slice(marker + 1)).toContainEqual(
+        expect.objectContaining({ sessionUpdate: 'state_update', state: 'idle' }),
+      )
+      expect(await send()).toEqual(original)
+      await server.agent.request(acp.methods.agent.session.close, { sessionId })
+      await server.agent.request(acp.methods.agent.session.close, { sessionId })
+      await server.finish()
+      expect(
+        server.notifications.filter(({ update }) => update.sessionUpdate === 'user_message'),
+      ).toHaveLength(1)
+    } finally {
+      await server.stop()
+      await rm(cwd, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  it('uses a client-provided MCP server over ACP with the correlated tool approval', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'dsh-acp-mcp-over-acp-'))
+    const server = launch(cwd, 'hold')
+    const calls: unknown[] = []
+    try {
+      expect(await server.initialize()).toMatchObject({
+        capabilities: { session: { mcp: { acp: {} } } },
+      })
+      await using tools = server.exposeMcp({
+        name: 'fixture',
+        handler({ method, params, protocolVersion }) {
+          expect(protocolVersion).toBe('2026-07-28')
+          if (method === 'server/discover') {
+            return {
+              result: {
+                supportedVersions: ['2026-07-28'],
+                capabilities: { tools: {} },
+                ttlMs: 0,
+                cacheScope: 'private',
+              },
+            }
+          }
+          if (method === 'tools/list') {
+            return {
+              result: {
+                resultType: 'complete',
+                ttlMs: 0,
+                cacheScope: 'private',
+                tools: [{ name: 'add', inputSchema: { type: 'object' } }],
+              },
+            }
+          }
+          if (method === 'tools/call') {
+            calls.push(params)
+            return { result: { resultType: 'complete', content: [{ type: 'text', text: '5' }] } }
+          }
+          throw new acp.McpProtocolError(-32601, 'Method not found')
+        },
+      })
+      const { sessionId } = await server.newSession([tools.declaration])
+      await server.prompt(sessionId, 'with-mcp')
+      await server.waitFor(() => server.requests.length === 1)
+      const update = server.notifications
+        .map(({ update }) => update)
+        .filter(acp.SessionUpdate.isToolCallUpdate)
+        .find(({ name }) => name === 'mcp__fixture__add')
+      expect(update).toBeDefined()
+      expect(server.requests[0]?.subject).toEqual({
+        type: 'tool_call',
+        toolCall: { toolCallId: update?.toolCallId, name: 'mcp__fixture__add' },
+      })
+      expect(calls).toHaveLength(0)
+      server.allowPermissions()
+      await server.idle(sessionId)
+      expect(reply(server.notifications)).toContain('tool=5')
+      expect(calls).toEqual([expect.objectContaining({ name: 'add' })])
+      await server.finish()
+    } finally {
+      await server.stop()
+      await rm(cwd, { recursive: true, force: true })
+    }
+  }, 30_000)
+
   it('streams text and reasoning before settlement and reconciles restart replay with the same identities', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'dsh-acp-v2-stream-'))
     let server = launch(cwd)

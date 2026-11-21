@@ -1,9 +1,11 @@
 /** Direct Harness session ownership, queued admission and quiescent completion. */
 import type { Context } from '@deepseek-ai/cordis'
+import { createHash } from 'node:crypto'
 import { RequestError } from '@agentclientprotocol/sdk'
 import type { Agent, AgentHandle, AgentStatus, AssistantStreamFrame } from '@deepseek-ai/dsh-agent'
-import { createUserMessage, errorChain } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, errorChain, MessageId } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent, TurnEndReason } from '@deepseek-ai/dsh-session'
+import type {} from '@deepseek-ai/dsh-subagent'
 import type { TodoItem } from '@deepseek-ai/dsh-tool-todo'
 import { AcpContentError, admitAcpPrompt } from './content.js'
 import { AcpModelControl } from './model.js'
@@ -25,11 +27,6 @@ import type {
   RuntimeUpdate,
 } from './types.js'
 
-interface Descendants {
-  waitForChildren(agent: Agent): Promise<boolean>
-  drainDescendants(agents: readonly Agent[]): Promise<void>
-}
-
 interface Submission {
   content: readonly PromptContent[]
   imageEnabled: boolean
@@ -37,8 +34,16 @@ interface Submission {
   done: PromiseWithResolvers<Outcome>
   abort: AbortController
   removeListener(): void
+  messageId?: MessageId
   id?: string
   inserted: boolean
+}
+
+const IDEMPOTENT_MESSAGE_PREFIX = 'acp-key:'
+
+interface KeyedPrompt {
+  abort: AbortController
+  accepted: Promise<string>
 }
 
 export interface PromptOperation {
@@ -50,6 +55,7 @@ export class HarnessSession {
   readonly agent: Agent
   private readonly model: AcpModelControl
   private optionTail = Promise.resolve()
+  private lastConfig: string | undefined
   private tail = Promise.resolve()
   private readonly queue: Submission[] = []
   private current: Submission | undefined
@@ -69,6 +75,9 @@ export class HarnessSession {
   private configurationTail = Promise.resolve()
   private readonly lifetime = new AbortController()
   private readonly stream = new AssistantStream()
+  private readonly keyedPrompts = new Map<MessageId, KeyedPrompt>()
+  private readonly insertedKeys = new Set<MessageId>()
+  private keyHistory: Promise<void> | undefined
 
   constructor(
     private readonly ctx: Context,
@@ -85,7 +94,8 @@ export class HarnessSession {
     return this.agent.session
   }
 
-  activate(): void {
+  activate(options: ConfigOption[]): void {
+    this.lastConfig = JSON.stringify(options)
     this.ready = true
   }
 
@@ -101,16 +111,20 @@ export class HarnessSession {
     const signal = AbortSignal.any([requestSignal, this.lifetime.signal])
     const operation = this.optionTail.then(async () => {
       signal.throwIfAborted()
+      let options: ConfigOption[]
       if (id === PERMISSION_CONFIG_ID) {
         setPermissionConfig(this.ctx, this.session, value)
         await this.ctx.sessions.flush(this.session)
         signal.throwIfAborted()
-        return this.configOptions(signal)
+        options = await this.configOptions(signal)
+      } else {
+        options = [
+          ...(await this.model.set(id, value, signal)),
+          ...permissionConfigOptions(this.ctx, this.session),
+        ]
       }
-      return [
-        ...(await this.model.set(id, value, signal)),
-        ...permissionConfigOptions(this.ctx, this.session),
-      ]
+      await this.publishConfig(options)
+      return options
     })
     this.optionTail = operation.then(
       () => undefined,
@@ -140,6 +154,7 @@ export class HarnessSession {
     imageEnabled: boolean,
     signal: AbortSignal,
     queueWhileBusy: boolean,
+    messageId?: MessageId,
   ): PromptOperation {
     this.assertOpen()
     if (!queueWhileBusy && (!this.isForegroundIdle() || this.queue.length > 0)) {
@@ -155,6 +170,7 @@ export class HarnessSession {
       done,
       abort,
       inserted: false,
+      ...(messageId === undefined ? {} : { messageId }),
       removeListener: () => signal.removeEventListener('abort', onAbort),
     }
     const onAbort = (): void => {
@@ -171,6 +187,64 @@ export class HarnessSession {
     this.queue.push(submission)
     this.startPump()
     return { accepted: accepted.promise, done: done.promise }
+  }
+
+  /** Join concurrent retries and recover earlier insertions from durable message IDs. */
+  async submitKeyed(
+    content: readonly PromptContent[],
+    imageEnabled: boolean,
+    signal: AbortSignal,
+    key: string,
+  ): Promise<string> {
+    this.assertOpen()
+    if (signal.aborted) throw RequestError.requestCancelled()
+    const hash = createHash('sha256')
+      .update(JSON.stringify([this.session.id, key]))
+      .digest('hex')
+    const messageId = MessageId(`${IDEMPOTENT_MESSAGE_PREFIX}${hash}`)
+    if (this.insertedKeys.has(messageId)) return messageId
+    let entry = this.keyedPrompts.get(messageId)
+    if (entry === undefined) {
+      const abort = new AbortController()
+      const admission = AbortSignal.any([abort.signal, this.lifetime.signal])
+      const accepted = this.submit(
+        content,
+        imageEnabled,
+        admission,
+        true,
+        messageId,
+      ).accepted.finally(() => this.keyedPrompts.delete(messageId))
+      entry = { abort, accepted }
+      this.keyedPrompts.set(messageId, entry)
+    }
+    const { abort, accepted } = entry
+    // Cancellation of any pending retry withdraws the shared submission before insertion.
+    const cancel = (): void => abort.abort(RequestError.requestCancelled())
+    signal.addEventListener('abort', cancel, { once: true })
+    try {
+      return await accepted
+    } finally {
+      signal.removeEventListener('abort', cancel)
+    }
+  }
+
+  private loadKeyHistory(): Promise<void> {
+    this.keyHistory ??= (async () => {
+      if (this.session.firstLiveSeq === 0) return
+      const signal = this.lifetime.signal
+      await using handle = await this.ctx.sessionPersistence.open(this.session.id, 'read', {
+        signal,
+      })
+      const { events } = await handle.read(0, this.session.firstLiveSeq, { signal })
+      for (const event of events) {
+        if (event.type === 'user/message' && event.data.id.startsWith(IDEMPOTENT_MESSAGE_PREFIX))
+          this.insertedKeys.add(event.data.id)
+      }
+    })().catch((error: unknown) => {
+      this.keyHistory = undefined
+      throw error
+    })
+    return this.keyHistory
   }
 
   cancel(): void {
@@ -204,6 +278,20 @@ export class HarnessSession {
       const submission = this.queue[0]!
       let failure: unknown
       try {
+        const id = submission.messageId
+        if (id !== undefined) {
+          const signal = submission.abort.signal
+          await untilAborted(this.loadKeyHistory(), signal)
+          signal.throwIfAborted()
+          if (this.insertedKeys.has(id)) {
+            this.queue.shift()
+            submission.inserted = true
+            submission.removeListener()
+            submission.accepted.resolve(id)
+            submission.done.resolve({ reason: 'end_turn' })
+            continue
+          }
+        }
         await this.admit(submission)
         await this.waitForQuiescence()
         await this.ctx.sessions.flush(this.session)
@@ -282,7 +370,11 @@ export class HarnessSession {
       if (!this.model.matches(selection)) continue
       if (this.ctx.agents.get(this.agent.id) !== this.agent)
         throw new Error('the Harness agent is no longer active')
-      const message = createUserMessage({ content, source: { kind: 'user' } })
+      const composed = createUserMessage({ content, source: { kind: 'user' } })
+      const message =
+        submission.messageId === undefined
+          ? composed
+          : Object.freeze({ ...composed, id: submission.messageId })
       this.queue.shift()
       this.current = submission
       this.ended = undefined
@@ -308,14 +400,14 @@ export class HarnessSession {
 
   /** whenIdle also waits for the driver to retire after error/status events. */
   private async waitForQuiescence(): Promise<void> {
-    const children = this.ctx.get('subagents') as Descendants | undefined
+    const children = this.ctx.get('subagents')
     for (;;) {
       await this.agent.whenIdle()
       const seq = this.session.seq
       const signal = this.activityAbort.signal
       if (children !== undefined && !signal.aborted) {
         try {
-          if (await untilAborted(children.waitForChildren(this.agent), signal)) continue
+          if (await untilAborted(children.waitForTreeWork(this.agent), signal)) continue
         } catch (error) {
           if (!isAborted(signal)) throw error
         }
@@ -345,6 +437,7 @@ export class HarnessSession {
     }
     if (event.type === 'user/message' && event.data.id === this.current?.id) {
       this.current.inserted = true
+      if (this.current.messageId !== undefined) this.insertedKeys.add(this.current.messageId)
       this.current.accepted.resolve(event.data.id)
     }
     if (event.type === 'turn/end') {
@@ -435,6 +528,8 @@ export class HarnessSession {
                 : undefined
             await send({ type: 'event', event, replay: true, assistant })
           }
+          signal.throwIfAborted()
+          await send({ type: 'replay_complete' })
         }
         await drain()
         // Capture together before awaits; later live changes follow this snapshot.
@@ -457,6 +552,7 @@ export class HarnessSession {
 
   async permission(
     callId: string,
+    toolName: string,
     title: string,
     requestSignal?: AbortSignal,
   ): Promise<'allowed-once' | 'rejected' | 'cancelled'> {
@@ -469,7 +565,10 @@ export class HarnessSession {
       await untilAborted(this.tail, signal)
       this.waitingPermissions.add(callId)
       await this.permissionState()
-      return await untilAborted(this.output.permission(this.session, callId, title, signal), signal)
+      return await untilAborted(
+        this.output.permission(this.session, callId, toolName, title, signal),
+        signal,
+      )
     } catch (error) {
       if (isAborted(signal)) return 'cancelled'
       throw error
@@ -489,15 +588,24 @@ export class HarnessSession {
   }
 
   configurationChanged(): void {
-    void this.configOptions(this.lifetime.signal)
-      .then((options) => {
+    const refresh = this.optionTail
+      .then(async () => {
         if (this.ready && this.closing === undefined)
-          return this.enqueue({ type: 'config', options })
+          await this.publishConfig(await this.configOptions(this.lifetime.signal))
       })
       .catch((error: unknown) => {
         if (this.closing === undefined)
           this.ctx.logger.warn(`dsh-acp: configuration refresh failed: ${errorChain(error)}`)
       })
+    this.optionTail = refresh
+  }
+
+  private async publishConfig(options: ConfigOption[]): Promise<void> {
+    if (!this.ready || this.closing !== undefined) return
+    const snapshot = JSON.stringify(options)
+    if (snapshot === this.lastConfig) return
+    this.lastConfig = snapshot
+    await this.enqueue({ type: 'config', options })
   }
 
   private setActivity(activity: Activity): Promise<void> {
@@ -547,7 +655,7 @@ export class HarnessSession {
         await this.tail
       },
       async () => {
-        await (this.ctx.get('subagents') as Descendants | undefined)?.drainDescendants([this.agent])
+        await this.ctx.get('subagents')?.drainDescendants([this.agent])
       },
       async () => {
         this.model.finishTurn()

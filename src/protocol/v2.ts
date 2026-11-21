@@ -1,5 +1,6 @@
 /** Experimental ACP v2 handlers over the shared Harness runtime, without a v1 relay. */
-import * as acp from '@agentclientprotocol/sdk/experimental/v2'
+import * as acp from '@agentclientprotocol/sdk/experimental/v2/unstable'
+import { McpOverAcpHttpBridge } from '@agentclientprotocol/sdk/experimental/mcp-http'
 import type { HarnessRuntime, SessionSetup } from '../harness/runtime.js'
 import type { ConfigOption, PromptContent, RuntimeOutput, StopReason } from '../harness/types.js'
 import type { Session } from '@deepseek-ai/dsh-session'
@@ -30,13 +31,15 @@ function content(blocks: readonly acp.ContentBlock[]): PromptContent[] {
   })
 }
 
-function setup(params: acp.NewSessionRequest | acp.ResumeSessionRequest): SessionSetup {
+async function setup(
+  bridge: McpOverAcpHttpBridge,
+  client: acp.AgentContext,
+  params: acp.NewSessionRequest | acp.ResumeSessionRequest,
+): Promise<SessionSetup> {
+  const servers = await bridge.adaptServers(client, params.mcpServers ?? [])
   return {
     cwd: params.cwd,
-    ...(params.additionalDirectories === undefined
-      ? {}
-      : { additionalDirectories: params.additionalDirectories }),
-    mcpServers: (params.mcpServers ?? []).map((server) => {
+    mcpServers: servers.map((server) => {
       if (acp.McpServer.isStdio(server))
         return {
           name: server.name,
@@ -89,7 +92,7 @@ function output(
     )
   return {
     fail,
-    async permission(session, callId, title, signal) {
+    async permission(session, callId, toolName, title, signal) {
       const { outcome } = await client.request(
         acp.methods.client.session.requestPermission,
         {
@@ -97,7 +100,7 @@ function output(
           title,
           subject: {
             type: 'tool_call',
-            toolCall: { toolCallId: calls(session).get(callId) ?? callId },
+            toolCall: { toolCallId: calls(session).get(callId) ?? callId, name: toolName },
           },
           options: permissionOptions,
         },
@@ -109,6 +112,10 @@ function output(
     },
     async send(session, update) {
       const send = (value: acp.SessionUpdate) => notify(session.id, value)
+      if (update.type === 'replay_complete') {
+        await send({ sessionUpdate: 'replay_complete' })
+        return
+      }
       if (update.type === 'chunk') {
         const content = { type: 'text' as const, text: update.text }
         await send(
@@ -205,6 +212,7 @@ function output(
         await send({
           sessionUpdate: 'tool_call_update',
           toolCallId,
+          name: event.data.name,
           title: event.data.name,
           kind: toolKind(event.data.name),
           status: 'in_progress',
@@ -232,8 +240,11 @@ function output(
 }
 
 export function v2Agent(runtime: HarnessRuntime, fail: (error: unknown) => void) {
+  const mcp = new acp.McpOverAcpCaller({ clientInfo: { name: 'dsh-acp', version: VERSION } })
+  const bridge = new McpOverAcpHttpBridge(mcp)
   return acp
     .agent({ name: 'dsh-acp-v2' })
+    .onNotification(acp.methods.agent.mcp.message, mcp.handleNotification)
     .onRequest(acp.methods.agent.initialize, ({ client }) =>
       wire(async () => {
         await runtime.initialize(output(runtime, client, fail))
@@ -243,27 +254,31 @@ export function v2Agent(runtime: HarnessRuntime, fail: (error: unknown) => void)
           capabilities: {
             session: {
               prompt: { ...(runtime.imageEnabled ? { image: {} } : {}) },
-              mcp: { stdio: {}, http: {} },
+              mcp: { stdio: {}, http: {}, acp: {} },
             },
           },
           authMethods: [],
         }
       }),
     )
-    .onRequest(acp.methods.agent.session.new, ({ params, signal }) =>
+    .onRequest(acp.methods.agent.session.new, ({ params, signal, client }) =>
       wire(async () => {
-        const record = await runtime.create(setup(params), signal)
+        const record = await runtime.create(await setup(bridge, client, params), signal)
         return {
           sessionId: record.session.id,
           configOptions: v2Config(await record.configOptions(signal)),
         }
       }),
     )
-    .onRequest(acp.methods.agent.session.resume, ({ params, signal }) =>
+    .onRequest(acp.methods.agent.session.resume, ({ params, signal, client }) =>
       wire(async () => {
         if (params.replayFrom != null && !acp.ReplayFrom.isStart(params.replayFrom))
           throw acp.RequestError.invalidParams(undefined, 'unsupported replay cursor')
-        const record = await runtime.resume(params.sessionId, setup(params), signal)
+        const record = await runtime.resume(
+          params.sessionId,
+          await setup(bridge, client, params),
+          signal,
+        )
         const configOptions = v2Config(await record.configOptions(signal))
         await record.synchronize(true, signal, params.replayFrom != null)
         return { configOptions }
@@ -292,11 +307,16 @@ export function v2Agent(runtime: HarnessRuntime, fail: (error: unknown) => void)
       }),
     )
     .onRequest(acp.methods.agent.session.prompt, ({ params, signal }) =>
-      wire(async () => ({
-        messageId: await runtime
-          .require(params.sessionId)
-          .submit(content(params.prompt), runtime.imageEnabled, signal, true).accepted,
-      })),
+      wire(async () => {
+        const record = runtime.require(params.sessionId)
+        const prompt = content(params.prompt)
+        const key = params.idempotencyKey
+        const messageId =
+          key == null
+            ? await record.submit(prompt, runtime.imageEnabled, signal, true).accepted
+            : await record.submitKeyed(prompt, runtime.imageEnabled, signal, key)
+        return { messageId }
+      }),
     )
     .onNotification(acp.methods.agent.session.cancel, ({ params }) =>
       runtime.cancel(params.sessionId),

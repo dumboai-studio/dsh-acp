@@ -3,7 +3,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import {
   agentProtocolRouter,
   ndJsonStream,
-  type AnyWireMessage,
+  type AnyMessage,
 } from '@agentclientprotocol/sdk/experimental/v2'
 import { Readable, Writable } from 'node:stream'
 import { type DshAcpConfig } from './config.js'
@@ -43,10 +43,9 @@ export function apply(ctx: Context, config: DshAcpConfig): void {
     .withV2(v2Agent(runtime, fail))
     .connect({
       ...transport,
-      readable: transport.readable.pipeThrough(
-        new TransformStream<AnyWireMessage, AnyWireMessage>(),
-        { signal: abort.signal },
-      ),
+      readable: transport.readable.pipeThrough(new TransformStream<AnyMessage, AnyMessage>(), {
+        signal: abort.signal,
+      }),
     })
   void connection.closed
     .then(() => {

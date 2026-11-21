@@ -27,7 +27,7 @@ function output(
     )
   return {
     fail,
-    async permission(session, callId, _title, signal) {
+    async permission(session, callId, _toolName, _title, signal) {
       const { outcome } = await client.request<RequestPermissionResponse>(
         methods.client.session.requestPermission,
         {
@@ -53,7 +53,7 @@ function output(
         })
         return
       }
-      if (update.type === 'state') return
+      if (update.type === 'state' || update.type === 'replay_complete') return
       if (update.type === 'title') {
         const value = titleUpdate(update.title)
         if (value !== undefined) await send(value)

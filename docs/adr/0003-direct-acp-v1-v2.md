@@ -4,13 +4,13 @@ Status: Implemented in 0.7.0. Supersedes ADR 0002.
 
 ## Decision
 
-Use one Harness session runtime and two ACP SDK handlers. The SDK 2.1.0 protocol router negotiates v1 or experimental v2 at initialization. Neither handler invokes the official Harness ACP implementation. The existing Harness CLI profile still composes the model, tools, persistence and startup services; the packaged overlay disables its ACP server and loads our plugin.
+Use one Harness session runtime and two ACP SDK handlers. The ACP SDK protocol router negotiates v1 or experimental v2 at initialization. Neither handler invokes the official Harness ACP implementation. The existing Harness CLI profile still composes the model, tools, persistence and startup services; the packaged overlay disables its ACP server and loads our plugin.
 
 The adapter pins its Harness dependencies to the same [CLI release](../../package.json) and uses `agents.create/resume`, `Agent.followup/cancel/whenIdle`, model selection, typed session events, registered title/todo projections, session persistence readers and title checkpoints. Some content/model/MCP admission helpers are adapted from the MIT-licensed upstream sources, with attribution in THIRD_PARTY_NOTICES.md. No deprecated in-memory event snapshots or private official ACP imports are used. These public APIs are pre-stable, so every dependency upgrade still requires compatibility checks.
 
 ## Session ownership
 
-A connection owns exact Agent and Session instances. Each session has a FIFO prompt queue, an ordered output queue and a close operation. V1 rejects overlapping prompts and returns completion after the driver, descendants and accepted updates drain. V2 keeps busy prompts pending until Harness commits their user message; it acknowledges that durable message ID separately from foreground state. Cancellation before insertion rejects the request; after insertion it cannot withdraw the successful acknowledgement. Session cancellation cancels foreground work and queued admissions.
+A connection owns exact Agent and Session instances. Each session has a FIFO prompt queue, an ordered output queue and a close operation. V1 rejects overlapping prompts and returns completion after the driver, descendants and accepted updates drain. V2 keeps busy prompts pending until Harness commits their user message; it acknowledges that durable message ID separately from foreground state. Cancellation before insertion rejects the request; after insertion it cannot withdraw the successful acknowledgement. Session cancellation cancels foreground work and queued admissions. A v2 idempotency key derives an opaque user message ID scoped to its session. Concurrent retries share one admission. The retained event remembers the insertion across restarts without recording the key.
 
 Foreground ownership includes work started by Harness without an ACP prompt. Held submissions remain in the queue while that work runs or waits for permission; admission rechecks quiescence after asynchronous content preparation. Only the synchronous `Agent.followup` handoff gives a submission ownership of execution and cancellation. Rejected or cancelled queue entries cannot change the current task's outcome. Closing also reports the final cancelled idle state for autonomous work before its response, after Agent disposal and final output delivery.
 
@@ -18,9 +18,9 @@ Errors after v2 insertion become idle state updates with an error stop reason. N
 
 ## Resume and presentation
 
-V1 retains its existing resume-without-replay behavior. V2 always synchronizes foreground state before responding. A `start` replay cursor reads retained events through the public persistence service and reconstructs messages, tools and plans. Live updates are buffered during synchronization and delivered in order so replay cannot overwrite newer state. User message IDs survive reconnects. Unknown cursors are rejected.
+V1 retains its existing resume-without-replay behavior. V2 always synchronizes foreground state before responding. A `start` replay cursor reads retained events through the public persistence service and reconstructs messages, tools and plans. Replay sends `replay_complete` before the current state snapshot. Live updates are buffered during synchronization and delivered in order so replay cannot overwrite newer state. User message IDs survive reconnects. Unknown cursors are rejected.
 
-The registered title/todo projections supply current snapshots and live changes. Tool categories are inferred from known tool names; unknown and MCP tools remain generic. Model configuration is per session and pinned to each admitted turn. Model changes during execution are deferred until the agent is idle. Harness records the selection through `agent.model.select()` and restores it through `agent.model.current()` when the session reopens. MCP replacement waits for foreground quiescence and restores the previous mounts if loading the replacement fails; failed rollback prevents further prompts on that session.
+The registered title/todo projections supply current snapshots and live changes. Tool categories are inferred from known tool names; unknown and MCP tools remain generic. Model configuration is per session and pinned to each admitted turn. Model changes during execution are deferred until the agent is idle. Harness records the selection through `agent.model.select()` and restores it through `agent.model.current()` when the session reopens. V2 MCP-over-ACP uses the SDK’s authenticated loopback HTTP bridge to attach client-provided servers to the existing Harness MCP service. MCP replacement waits for foreground quiescence and restores the previous mounts if loading the replacement fails; failed rollback prevents further prompts on that session.
 
 ## Streaming and permissions
 
@@ -32,7 +32,7 @@ The optional public `permissionPresets` service supplies the session's `mode` co
 
 ## Compatibility limits
 
-Existing CLI/environment/overlay usage and v1 display behavior remain supported. The adapter implements SDK 2.1.0's baseline v2 session surface, not every optional draft extension. It does not advertise MCP-over-ACP, additional directories, fork/delete, ACP terminal/filesystem, legacy session/set_mode or slash commands, or elicitation. The primary session working directory remains fixed.
+Existing CLI/environment/overlay usage and v1 display behavior remain supported. The adapter implements the preview v2 session surface against SDK 2.9.1. Optional additional directories, fork/delete, terminal/filesystem, child session controls, legacy session/set_mode, slash commands and elicitation are outside the advertised surface. The primary session working directory remains fixed.
 
 ## Validation
 

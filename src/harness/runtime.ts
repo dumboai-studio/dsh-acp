@@ -19,7 +19,6 @@ import type { McpConfiguration, RuntimeOutput } from './types.js'
 export interface SessionSetup {
   cwd: string
   mcpServers: readonly McpConfiguration[]
-  additionalDirectories?: readonly string[] | null
 }
 
 export class HarnessRuntime {
@@ -73,6 +72,7 @@ export class HarnessRuntime {
       if (record?.agent !== request.agent || request.callId === undefined) return next()
       return record.permission(
         request.callId,
+        request.toolName,
         request.reason ?? 'Allow this tool call?',
         request.signal,
       )
@@ -138,7 +138,7 @@ export class HarnessRuntime {
       if (id !== undefined) {
         const stored = await this.ctx.sessionPersistence.stat(sessionId, { signal })
         if (stored === undefined || stored.header.origin === 'subagent')
-          throw new RequestError(-32002, `Unknown session: ${id}`)
+          throw new RequestError(-32002, `Unknown session: ${id}`, { sessionId: id })
         if (!(await sameDirectory(stored.header.cwd, params.cwd)))
           throw RequestError.invalidParams(undefined, 'session cwd does not match')
       }
@@ -169,10 +169,10 @@ export class HarnessRuntime {
       record = new HarnessSession(this.ctx, handle, mcp!, params.mcpServers, output)
       signal.throwIfAborted()
       this.records.set(sessionId, record)
-      await record.configOptions(signal)
+      const configOptions = await record.configOptions(signal)
       await this.ctx.sessions.flush(record.session)
       signal.throwIfAborted()
-      record.activate()
+      record.activate(configOptions)
       return record
     } catch (error) {
       this.records.delete(sessionId)
@@ -255,7 +255,9 @@ export class HarnessRuntime {
   }
 
   async closeSession(id: string): Promise<void> {
-    const record = this.require(id)
+    this.assertOpen()
+    const record = this.records.get(id)
+    if (record === undefined) return
     try {
       await record.close()
     } finally {
@@ -298,8 +300,6 @@ export class HarnessRuntime {
 
 function validateWorkspace(params: SessionSetup): void {
   if (!isAbsolute(params.cwd)) throw RequestError.invalidParams(undefined, 'cwd must be absolute')
-  if ((params.additionalDirectories?.length ?? 0) > 0)
-    throw RequestError.invalidParams(undefined, 'additionalDirectories is not supported')
 }
 
 async function sameDirectory(left: string | undefined, right: string): Promise<boolean> {

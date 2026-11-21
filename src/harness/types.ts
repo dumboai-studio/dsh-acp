@@ -19,6 +19,7 @@ export type RuntimeUpdate =
       assistant?: AssistantDelivery | undefined
     }
   | AssistantChunk
+  | { type: 'replay_complete' }
   | { type: 'state'; activity: Activity }
   | { type: 'title'; title: string | null }
   | { type: 'plan'; todos: readonly TodoItem[] | null }
@@ -29,6 +30,7 @@ export interface RuntimeOutput {
   permission(
     session: Session,
     callId: string,
+    toolName: string,
     title: string,
     signal: AbortSignal,
   ): Promise<'allowed-once' | 'rejected' | 'cancelled'>

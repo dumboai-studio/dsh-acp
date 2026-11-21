@@ -326,3 +326,4 @@ minimumReleaseAgeExclude:
   - '@deepseek-ai/dsh-workspace-changes@0.2.2-rc.1'
   - '@deepseek-ai/dsh-workspace@0.2.2-rc.1'
   - '@deepseek-ai/dsh@0.2.2-rc.1'
+  - '@agentclientprotocol/sdk@2.9.1'
